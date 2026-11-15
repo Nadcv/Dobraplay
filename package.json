@@ -10,10 +10,11 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server.js",
     "dev": "node --disable-warning=ExperimentalWarning --watch server.js",
-    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 tests/*.test.js"
   },
   "dependencies": {
     "express": "^4.21.2",
+    "pg": "^8.23.1",
     "qrcode": "^1.5.4"
   }
 }

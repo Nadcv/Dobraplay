@@ -6,15 +6,27 @@ const { createApp } = require('../src/app');
 const { normalizePhone, parseAmount } = require('../src/util');
 
 const ADMIN = '9900000';
-let server, base;
+let server, base, db;
+
+// Por omissão os testes usam SQLite em memória. Com TEST_DATABASE_URL correm
+// contra PostgreSQL (a base de dados é APAGADA: use uma base só de testes).
+const PG_URL = process.env.TEST_DATABASE_URL;
 
 test.before(async () => {
-  const service = createService(openDb(':memory:'), { adminPhone: ADMIN });
+  if (PG_URL) {
+    const { Client } = require('pg');
+    const c = new Client({ connectionString: PG_URL });
+    await c.connect();
+    await c.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    await c.end();
+  }
+  db = await openDb(PG_URL ? { url: PG_URL } : { file: ':memory:' });
+  const service = createService(db, { adminPhone: ADMIN });
   server = createApp(service).listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}/api`;
 });
-test.after(() => server.close());
+test.after(async () => { server.close(); await db.close(); });
 
 async function call(method, path, body, token) {
   const res = await fetch(base + path, {
@@ -223,6 +235,25 @@ test('PIN errado bloqueia a conta após 5 tentativas', async () => {
   }
   assert.equal((await call('POST', '/transfers', { to: '9912345', amount: '1', pin: '0000' }, carla.token)).status, 423);
   assert.equal((await call('POST', '/auth/login', { phone: '9945678', pin: '8264' })).status, 423);
+});
+
+test('pedidos simultâneos: nunca gasta mais do que tem nem paga duas vezes', async () => {
+  const rita = await register('9956789', 'Rita Pires');
+  await call('POST', '/agent/cash-in', { to: '9956789', amount: '1000', pin: '2580', idempotency_key: 'rita-in' }, agentST.token);
+  // 10 envios de 300 STN ao mesmo tempo com só 1 000 STN: no máximo 3 podem passar.
+  const results = await Promise.all(Array.from({ length: 10 }, (_, i) =>
+    call('POST', '/transfers', { to: '9923456', amount: '300', pin: '2580', idempotency_key: 'par-' + i }, rita.token)));
+  const ok = results.filter((r) => r.status === 200).length;
+  assert.equal(ok, 3, JSON.stringify(results.map((r) => r.body.error || 'ok')));
+  assert.ok(results.filter((r) => r.status !== 200).every((r) => r.body.error === 'insufficient_funds'), JSON.stringify(results.map((r) => r.body.error || 'ok')));
+  assert.equal(await bal(rita.token, 'STN'), 10_000);
+  // O mesmo pedido enviado 5 vezes ao mesmo tempo (rede fraca) só paga uma vez.
+  await call('POST', '/agent/cash-in', { to: '9956789', amount: '500', pin: '2580', idempotency_key: 'rita-in2' }, agentST.token);
+  const dup = await Promise.all(Array.from({ length: 5 }, () =>
+    call('POST', '/transfers', { to: '9923456', amount: '100', pin: '2580', idempotency_key: 'same-key' }, rita.token)));
+  assert.ok(dup.every((r) => r.status === 200), JSON.stringify(dup.map((r) => r.body)));
+  assert.equal(new Set(dup.map((r) => r.body.transaction.id)).size, 1);
+  assert.equal(await bal(rita.token, 'STN'), 50_000 + 10_000 - 10_000);
 });
 
 test('livro-razão: em cada moeda a soma de todos os saldos é zero', async () => {

@@ -1,0 +1,26 @@
+# Blueprint do Render: publica a DobraPay no plano grátis.
+# Render → "New" → "Blueprint" → escolher este repositório.
+# Guia completo: secção "Publicar grátis" do README.
+services:
+  - type: web
+    name: dobrapay
+    runtime: node
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: npm ci --omit=dev --no-audit --no-fund
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      # Endereço da base PostgreSQL grátis do Neon (obrigatório).
+      # O disco do Render apaga-se a cada reinício: o dinheiro vive no Neon.
+      - key: DATABASE_URL
+        sync: false
+      # O seu número, com indicativo (ex.: +2399900000): fica administrador.
+      - key: ADMIN_PHONE
+        sync: false

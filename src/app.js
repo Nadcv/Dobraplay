@@ -4,16 +4,23 @@ const path = require('path');
 const QRCode = require('qrcode');
 const C = require('./config');
 const { ApiError, parseAmount } = require('./util');
+const { isCheckViolation, isUniqueViolation } = require('./db');
 
-// Limitador simples em memória (por IP + rota). Para vários servidores, usar Redis.
-function rateLimit({ windowMs, max }) {
+// Limitador simples em memória. Para vários servidores, usar Redis.
+// A chave por omissão é o UTILIZADOR (ou o número de telefone no login), e não
+// só o IP: as operadoras móveis põem muitos clientes atrás do mesmo IP, e um
+// limite por IP bloquearia pessoas inocentes.
+const byUser = (req) => (req.user ? 'u' + req.user.id : 'ip' + req.ip);
+const byIpAndPhone = (req) => req.ip + '|' + String((req.body && req.body.phone) || '').replace(/\D/g, '').slice(-9);
+
+function rateLimit({ windowMs, max, key = byUser }) {
   const hits = new Map();
   setInterval(() => { const t = Date.now(); for (const [k, v] of hits) if (v.reset < t) hits.delete(k); }, windowMs).unref();
   return (req, res, next) => {
-    const key = req.ip + req.baseUrl + req.path;
+    const k = key(req) + req.baseUrl + req.route.path;
     const t = Date.now();
-    let h = hits.get(key);
-    if (!h || h.reset < t) { h = { n: 0, reset: t + windowMs }; hits.set(key, h); }
+    let h = hits.get(k);
+    if (!h || h.reset < t) { h = { n: 0, reset: t + windowMs }; hits.set(k, h); }
     if (++h.n > max) return next(new ApiError(429, 'rate_limited', 'Demasiados pedidos. Aguarde um pouco.'));
     next();
   };
@@ -40,12 +47,14 @@ function createApp(service) {
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   const api = express.Router();
-  const wrap = (fn) => (req, res, next) => { try { const out = fn(req, res); if (out !== undefined) res.json(out); } catch (e) { next(e); } };
+  const wrap = (fn) => async (req, res, next) => { try { const out = await fn(req, res); if (out !== undefined) res.json(out); } catch (e) { next(e); } };
   const bearer = (req) => (req.get('authorization') || '').replace(/^Bearer\s+/i, '') || null;
-  const auth = (req, res, next) => {
-    req.user = service.userFromToken(bearer(req));
-    if (!req.user) return next(new ApiError(401, 'unauthorized', 'Sessão expirada. Entre de novo.'));
-    next();
+  const auth = async (req, res, next) => {
+    try {
+      req.user = await service.userFromToken(bearer(req));
+      if (!req.user) return next(new ApiError(401, 'unauthorized', 'Sessão expirada. Entre de novo.'));
+      next();
+    } catch (e) { next(e); }
   };
   const amount = (v) => {
     const a = parseAmount(v);
@@ -64,14 +73,18 @@ function createApp(service) {
     fx_spread: C.FX_SPREAD,
     fees: { domestic: 'grátis', international: '1% (mín. 0,50 €, máx. 20 €)', cash_out: '1% (mín. 0,20 €, máx. 8 €)' },
   }));
-  api.get('/rates', (req, res) => res.json(service.listRates()));
+  // Para o alojamento saber se a app está viva (e a base de dados responde).
+  api.get('/health', wrap(async () => { await service.listRates(); return { ok: true }; }));
+  api.get('/rates', wrap(() => service.listRates()));
 
   // ----- Autenticação -----
-  const authLimit = rateLimit({ windowMs: 15 * 60000, max: 20 });
-  api.post('/auth/register', authLimit, wrap((req) => service.register(body(req), req.ip)));
-  api.post('/auth/login', authLimit, wrap((req) => service.login(body(req), req.ip)));
-  api.post('/auth/logout', auth, wrap((req) => { service.logout(bearer(req)); return { ok: true }; }));
-  api.post('/me/pin', auth, authLimit, wrap((req) => { service.changePin(req.user, body(req), req.ip); return { ok: true }; }));
+  // Tentativas de entrada por número (o PIN também bloqueia após 5 erros) e um teto por IP.
+  const authLimit = rateLimit({ windowMs: 15 * 60000, max: 20, key: byIpAndPhone });
+  const ipLimit = rateLimit({ windowMs: 15 * 60000, max: 300, key: (req) => req.ip });
+  api.post('/auth/register', ipLimit, authLimit, wrap((req) => service.register(body(req), req.ip)));
+  api.post('/auth/login', ipLimit, authLimit, wrap((req) => service.login(body(req), req.ip)));
+  api.post('/auth/logout', auth, wrap(async (req) => { await service.logout(bearer(req)); return { ok: true }; }));
+  api.post('/me/pin', auth, rateLimit({ windowMs: 15 * 60000, max: 10 }), wrap(async (req) => { await service.changePin(req.user, body(req), req.ip); return { ok: true }; }));
   api.post('/me/receive-currency', auth, wrap((req) => service.setReceiveCurrency(req.user, body(req).currency)));
 
   // ----- Cliente -----
@@ -157,7 +170,8 @@ function createApp(service) {
   app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
     if (err instanceof ApiError) return res.status(err.status).json({ error: err.code, message: err.message });
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'bad_json', message: 'Pedido inválido.' });
-    if (String(err.message).includes('CHECK constraint')) return res.status(402).json({ error: 'insufficient_funds', message: 'Saldo insuficiente.' });
+    if (isCheckViolation(err)) return res.status(402).json({ error: 'insufficient_funds', message: 'Saldo insuficiente.' });
+    if (isUniqueViolation(err)) return res.status(409).json({ error: 'conflict', message: 'Pedido repetido. Atualize e tente de novo.' });
     console.error(err);
     res.status(500).json({ error: 'server_error', message: 'Erro interno. Tente de novo.' });
   });
