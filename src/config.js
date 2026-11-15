@@ -44,6 +44,9 @@ module.exports = {
     international: (eur) => Math.min(Math.max(Math.round(eur * 0.01), 50), 20 * EUR), // 1% (mín. 0,50 €, máx. 20 €)
     cashOut: (eur) => Math.min(Math.max(Math.round(eur * 0.01), 20), 8 * EUR),        // 1% (mín. 0,20 €, máx. 8 €)
     exchange: () => 0,                                                          // trocar entre as próprias carteiras: só a margem de câmbio
+    bankIn: () => 0,                                                            // carregar por transferência bancária: grátis
+    bankOut: (eur) => Math.min(Math.max(Math.round(eur * 0.01), 50), 5 * EUR),  // levantar para o banco: 1% (mín. 0,50 €, máx. 5 €)
+    merchant: () => 0,                                                          // pagar numa loja: grátis para o cliente (só a margem se houver câmbio)
   },
 
   MIN_AMOUNT: 1, // 1 cêntimo (valida-se também pelo mínimo em euros abaixo)
@@ -53,4 +56,6 @@ module.exports = {
   PIN_LOCK_MINUTES: 15,
   CASHOUT_CODE_MINUTES: 30,
   CASHOUT_CODE_MAX_ATTEMPTS: 5,
+  CHARGE_MINUTES: 15,      // validade de uma cobrança de loja (QR)
+  BANK_DEPOSIT_DAYS: 7,    // pedido de carregamento por transferência fica aberto 7 dias
 };

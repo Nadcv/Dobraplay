@@ -14,13 +14,15 @@
 //    emite dinheiro eletrónico);
 //  - fees: taxas cobradas;
 //  - fx: a "mesa de câmbio". Numa conversão STN→EUR, a mesa recebe as Dobras e
-//    paga os Euros, por isso cada moeda continua a somar zero.
+//    paga os Euros, por isso cada moeda continua a somar zero;
+//  - payout: levantamentos por transferência bancária já pedidos mas ainda
+//    não pagos pelo banco (o dinheiro sai da carteira logo no pedido).
 const fs = require('fs');
 const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 3; // 3 = SQLite + PostgreSQL
+const SCHEMA_VERSION = 4; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + pagamentos em lojas
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
 const SCHEMA = `
@@ -41,13 +43,14 @@ const SCHEMA = `
     status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','blocked')),
     failed_pins       INTEGER NOT NULL DEFAULT 0,
     locked_until      INTEGER NOT NULL DEFAULT 0,
+    merchant_name     TEXT,                          -- preenchido = conta de loja (recebe pagamentos com QR)
     created_at        INTEGER NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS accounts (
     id        INTEGER PRIMARY KEY,
     user_id   INTEGER REFERENCES users(id),
-    kind      TEXT NOT NULL CHECK (kind IN ('wallet','system_float','fees','fx')),
+    kind      TEXT NOT NULL CHECK (kind IN ('wallet','system_float','fees','fx','payout')),
     currency  TEXT NOT NULL,
     balance   INTEGER NOT NULL DEFAULT 0,
     -- Carteiras nunca podem ficar negativas (proteção final na própria BD).
@@ -65,7 +68,7 @@ const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS transactions (
     id               TEXT PRIMARY KEY,
-    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange')),
+    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund')),
     from_account     INTEGER NOT NULL REFERENCES accounts(id),
     to_account       INTEGER NOT NULL REFERENCES accounts(id),
     amount           INTEGER NOT NULL CHECK (amount > 0),     -- na moeda de origem
@@ -124,6 +127,64 @@ const SCHEMA = `
     agent_id       INTEGER REFERENCES users(id),
     tx_id          TEXT REFERENCES transactions(id),
     created_at     INTEGER NOT NULL
+  );
+
+  -- Contas bancárias da EMPRESA, uma por moeda (ex.: EUR na CGD, STN no BISTP).
+  CREATE TABLE IF NOT EXISTS company_bank_accounts (
+    currency    TEXT PRIMARY KEY,
+    bank_name   TEXT NOT NULL,
+    holder      TEXT NOT NULL,
+    iban        TEXT NOT NULL,
+    swift       TEXT,
+    updated_at  INTEGER NOT NULL
+  );
+
+  -- Carregamentos (deposit) e levantamentos (withdrawal) por transferência bancária.
+  CREATE TABLE IF NOT EXISTS bank_requests (
+    id              INTEGER PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    kind            TEXT NOT NULL CHECK (kind IN ('deposit','withdrawal')),
+    amount          INTEGER NOT NULL CHECK (amount > 0),
+    currency        TEXT NOT NULL,
+    fee             INTEGER NOT NULL DEFAULT 0,
+    reference       TEXT NOT NULL UNIQUE,          -- o cliente escreve-a no descritivo da transferência
+    iban            TEXT,                          -- levantamento: conta de destino do cliente
+    holder          TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','rejected','cancelled')),
+    bank_reference  TEXT,                          -- referência do movimento no extrato do banco
+    note            TEXT,
+    tx_id           TEXT REFERENCES transactions(id),
+    final_tx_id     TEXT REFERENCES transactions(id),
+    handled_by      INTEGER REFERENCES users(id),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS bank_req_status ON bank_requests(status, kind);
+
+  -- Cobranças de lojas: a loja gera um QR, o cliente paga.
+  CREATE TABLE IF NOT EXISTS charges (
+    id           TEXT PRIMARY KEY,
+    code         TEXT NOT NULL,                    -- código curto para escrever à mão (ex.: K7Q2P9)
+    merchant_id  INTEGER NOT NULL REFERENCES users(id),
+    amount       INTEGER NOT NULL CHECK (amount > 0),
+    currency     TEXT NOT NULL,
+    description  TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','paid','cancelled')),
+    payer_id     INTEGER REFERENCES users(id),
+    tx_id        TEXT REFERENCES transactions(id),
+    expires_at   INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS charges_code ON charges(code);
+  CREATE INDEX IF NOT EXISTS charges_merchant ON charges(merchant_id, created_at);
+
+  -- Limite de liquidez por moeda: quanto o banco dessa moeda pode ficar a
+  -- dever aos clientes (à espera de um acerto entre bancos). Sem linha = sem limite.
+  CREATE TABLE IF NOT EXISTS liquidity_limits (
+    currency       TEXT PRIMARY KEY,
+    max_shortfall  INTEGER NOT NULL CHECK (max_shortfall >= 0),
+    updated_at     INTEGER NOT NULL,
+    updated_by     INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS audit_log (
@@ -241,30 +302,60 @@ function openPostgres(url) {
   };
 }
 
+// Atualizações de esquema para bases de dados que já existem (com clientes).
+// Cada passo corre uma única vez e não apaga nada.
+const MIGRATIONS = {
+  4: {
+    postgres: `
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS merchant_name TEXT;
+      ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_kind_check;
+      ALTER TABLE accounts ADD CONSTRAINT accounts_kind_check
+        CHECK (kind IN ('wallet','system_float','fees','fx','payout'));
+      ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
+      ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
+        CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund'));
+    `,
+    // No SQLite não dá para alterar CHECK sem reconstruir tabelas; como o
+    // SQLite só é usado no computador (dados de teste), pede-se para apagar.
+    sqlite: null,
+  },
+};
+
 async function openDb({ url, file } = {}) {
   const db = url ? openPostgres(url) : openSqlite(file || ':memory:');
-  const hasUsers = db.dialect === 'sqlite'
-    ? await db.get("SELECT 1 AS x FROM sqlite_master WHERE name = 'users'")
-    : await db.get("SELECT 1 AS x FROM information_schema.tables WHERE table_name = 'users'");
-  const hasMeta = db.dialect === 'sqlite'
-    ? await db.get("SELECT 1 AS x FROM sqlite_master WHERE name = 'schema_meta'")
-    : await db.get("SELECT 1 AS x FROM information_schema.tables WHERE table_name = 'schema_meta'");
+  const tableExists = (name) => (db.dialect === 'sqlite'
+    ? db.get('SELECT 1 AS x FROM sqlite_master WHERE name = ?', name)
+    : db.get('SELECT 1 AS x FROM information_schema.tables WHERE table_name = ?', name));
+  const hasUsers = await tableExists('users');
+  const hasMeta = await tableExists('schema_meta');
   if (hasUsers && !hasMeta) {
     throw new Error('A base de dados é de uma versão antiga. Como ainda não há clientes reais, apague-a e arranque de novo.');
   }
+  const current = hasMeta ? Number((await db.get("SELECT value FROM schema_meta WHERE key = 'version'"))?.value || 0) : 0;
+  if (current > SCHEMA_VERSION) throw new Error(`A base de dados é de uma versão mais recente (${current}) do que esta app (${SCHEMA_VERSION}). Atualize a app.`);
 
   await db.tx(async () => {
     if (db.dialect === 'postgres') {
-      // Impede que dois servidores criem as tabelas ao mesmo tempo.
+      // Impede que dois servidores criem ou atualizem as tabelas ao mesmo tempo.
       await db.execRaw('SELECT pg_advisory_xact_lock(239239)');
       await db.execRaw(pgSchema());
     } else {
       await db.execRaw(SCHEMA);
     }
-    await db.run('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT DO NOTHING', 'version', String(SCHEMA_VERSION));
+    if (hasUsers) {
+      for (let v = current + 1; v <= SCHEMA_VERSION; v++) {
+        const step = MIGRATIONS[v] && MIGRATIONS[v][db.dialect];
+        if (step === null) {
+          throw new Error(`A base de dados local (SQLite) é da versão ${current}. Apague o ficheiro (ex.: data/dobrapay.db) e arranque de novo: os dados locais são só de teste.`);
+        }
+        if (step) await db.execRaw(step);
+        console.log(`Base de dados atualizada para a versão ${v}.`);
+      }
+    }
+    await db.run('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value', 'version', String(SCHEMA_VERSION));
     // Contas internas da empresa e câmbio inicial (uma única vez por moeda).
     for (const [cur, info] of Object.entries(CURRENCIES)) {
-      for (const kind of ['system_float', 'fees', 'fx']) {
+      for (const kind of ['system_float', 'fees', 'fx', 'payout']) {
         await db.run('INSERT INTO accounts (kind, currency, balance) VALUES (?, ?, 0) ON CONFLICT DO NOTHING', kind, cur);
       }
       await db.run('INSERT INTO fx_rates (currency, per_eur, updated_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING', cur, info.perEur, Date.now());
