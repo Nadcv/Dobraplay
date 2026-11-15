@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const C = require('./config');
 const { isUniqueViolation } = require('./db');
 const { createPayoutProviders } = require('./payouts');
+const { createSmsSender } = require('./features/sms');
 const {
   ApiError, normalizePhone, countryOfPhone, isCurrency, hashPin, verifyPin, isValidPin, sha256, cleanText, formatAmount,
   normalizeIban, formatIban, randomCode,
@@ -22,8 +23,23 @@ const fmt = formatAmount;
 let seqCounter = 0;
 const nextSeq = () => now() * 1000 + (seqCounter++ % 1000);
 
-function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
+function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsSender, pushSender, requireOtp } = {}) {
   const adminPhoneNorm = adminPhone ? normalizePhone(adminPhone) : null;
+  const sms = smsSender || createSmsSender(env);
+  // Verificação por SMS obrigatória no registo (desliga-se com OTP_REQUIRED=false).
+  const otpRequired = requireOtp ?? env.OTP_REQUIRED !== 'false';
+
+  // Acontecimentos que as funcionalidades extra podem ouvir (ex.: notificações).
+  const events = new (require('events'))();
+  events.on('error', (err) => console.error('Erro num acontecimento:', err.message));
+
+  // Ações que correm DEPOIS de uma operação de dinheiro ficar gravada
+  // (notificações, alertas antifraude…). Nunca atrasam nem anulam a operação.
+  const afterCommitHooks = [];
+  const afterCommit = (txId) => {
+    if (!txId) return;
+    for (const h of afterCommitHooks) Promise.resolve().then(() => h(txId)).catch((err) => console.error('Erro depois da operação:', err.message));
+  };
   // Parceiros de pagamento; as confirmações chegam a handlePayoutEvent.
   const providers = createPayoutProviders({ onEvent: (...a) => handlePayoutEvent(...a), sandboxDelayMs, env });
   const like = db.dialect === 'postgres' ? 'ILIKE' : 'LIKE';
@@ -111,8 +127,59 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     if (user.failed_pins) await db.run('UPDATE users SET failed_pins = 0 WHERE id = ?', user.id);
   }
 
+  // ---------- Verificação por SMS ----------
+  const otpHash = (phone, purpose, code) => sha256(`${phone}|${purpose}|${code}`);
+
+  // Envia um código de 6 dígitos. Para recuperar o PIN, a resposta é igual
+  // quer o número tenha conta quer não (não revela quem é cliente).
+  async function requestOtp({ phone, country, purpose = 'register' }, ip) {
+    if (!['register', 'reset_pin'].includes(purpose)) throw new ApiError(400, 'bad_purpose', 'Pedido inválido.');
+    const ctry = C.COUNTRIES[country] ? country : 'ST';
+    const p = normalizePhone(phone, ctry);
+    if (!p) throw new ApiError(400, 'bad_phone', `Número inválido para ${C.COUNTRIES[ctry].name}. Exemplo: ${C.COUNTRIES[ctry].example}.`);
+    const exists = await userByPhone(p);
+    if (purpose === 'register' && exists) throw new ApiError(409, 'phone_taken', 'Este número já tem conta. Entre com o seu PIN.');
+    const { n } = await db.get('SELECT COUNT(*) AS n FROM otp_codes WHERE phone = ? AND created_at > ?', p, now() - 3_600_000);
+    if (n >= C.OTP_MAX_PER_HOUR) throw new ApiError(429, 'otp_limit', 'Pediu demasiados códigos. Tente de novo dentro de uma hora.');
+    const out = { phone: p, sent: true, expires_at: now() + C.OTP_MINUTES * 60000 };
+    if (purpose === 'reset_pin' && !exists) return out;
+    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    await db.run('INSERT INTO otp_codes (phone, purpose, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
+      p, purpose, otpHash(p, purpose, code), out.expires_at, now());
+    await sms.send(p, `${C.APP_NAME}: o seu código é ${code}. Válido ${C.OTP_MINUTES} min. Nunca o partilhe.`);
+    await audit(exists ? exists.id : null, 'otp_sent', { purpose, provider: sms.name }, ip);
+    // Em modo de teste (sem fornecedor de SMS) o código é mostrado no ecrã.
+    return sms.sandbox ? { ...out, dev_code: code } : out;
+  }
+
+  async function verifyOtp(phone, purpose, code) {
+    const row = await db.get('SELECT * FROM otp_codes WHERE phone = ? AND purpose = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1', phone, purpose);
+    if (!row || row.expires_at < now()) throw new ApiError(400, 'otp_expired', 'O código expirou ou não existe. Peça um novo código.');
+    if (row.attempts >= C.OTP_MAX_ATTEMPTS) throw new ApiError(423, 'otp_locked', 'Demasiadas tentativas. Peça um novo código.');
+    if (typeof code !== 'string' || row.code_hash !== otpHash(phone, purpose, code.trim())) {
+      await db.run('UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?', row.id);
+      throw new ApiError(401, 'otp_wrong', `Código errado. Restam ${C.OTP_MAX_ATTEMPTS - row.attempts - 1} tentativas.`);
+    }
+    await db.run('UPDATE otp_codes SET used_at = ? WHERE id = ?', now(), row.id);
+  }
+
+  // Esqueci o PIN: código por SMS + PIN novo. Termina as sessões noutros telemóveis.
+  async function resetPin({ phone, country, code, newPin }, ip) {
+    const p = normalizePhone(phone, C.COUNTRIES[country] ? country : 'ST');
+    if (!p) throw new ApiError(400, 'bad_phone', 'Número inválido.');
+    if (!isValidPin(newPin)) throw new ApiError(400, 'bad_pin', 'O novo PIN deve ter 4 a 6 dígitos e não pode ser óbvio.');
+    const user = await userByPhone(p);
+    if (!user) throw new ApiError(400, 'otp_expired', 'O código expirou ou não existe. Peça um novo código.');
+    if (user.status !== 'active') throw new ApiError(403, 'blocked', 'Conta bloqueada. Contacte o apoio ao cliente.');
+    await verifyOtp(p, 'reset_pin', code);
+    await db.run('UPDATE users SET pin_hash = ?, failed_pins = 0, locked_until = 0 WHERE id = ?', hashPin(newPin), user.id);
+    await db.run('DELETE FROM sessions WHERE user_id = ?', user.id);
+    await audit(user.id, 'pin_reset', null, ip);
+    return { token: await newSession(user.id), user: await publicUser(await userById(user.id)) };
+  }
+
   // ---------- Contas e sessões ----------
-  async function register({ phone, name, pin, country }, ip) {
+  async function register({ phone, name, pin, country, code }, ip) {
     const ctry = C.COUNTRIES[country] ? country : null;
     if (!ctry) throw new ApiError(400, 'bad_country', 'Escolha o seu país.');
     const p = normalizePhone(phone, ctry);
@@ -123,6 +190,8 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     if (!isValidPin(pin)) throw new ApiError(400, 'bad_pin', 'O PIN deve ter 4 a 6 dígitos e não pode ser óbvio (ex.: 1111, 1234).');
     const taken = new ApiError(409, 'phone_taken', 'Este número já tem conta. Entre com o seu PIN.');
     if (await userByPhone(p)) throw taken;
+    // O código por SMS prova que a pessoa tem mesmo este número.
+    if (otpRequired) await verifyOtp(p, 'register', code);
     const role = p === adminPhoneNorm ? 'admin' : 'user';
     const cur = C.COUNTRIES[realCountry].currency;
     let user;
@@ -389,6 +458,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     if (before) return before;
     try {
       const id = await db.tx(() => fn(key));
+      afterCommit(id);
       return { transaction: await txView(id, user), replayed: false };
     } catch (err) {
       // Dois pedidos iguais ao mesmo tempo: o segundo devolve o resultado do primeiro.
@@ -473,6 +543,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     if (n >= 3) throw new ApiError(429, 'too_many_requests', 'Já tem 3 pedidos pendentes para esta pessoa.');
     const { id } = await db.get('INSERT INTO money_requests (requester_id, payer_id, amount, currency, note, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
       user.id, payer.id, amount, cur, cleanText(note, 140), now());
+    events.emit('request_created', { requester: user, payer, amount, currency: cur, note });
     return requestView(await db.get('SELECT * FROM money_requests WHERE id = ?', id));
   }
 
@@ -558,10 +629,14 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     const from = homeCurrency(agent);
     const res = await idempotent(agent, idempotencyKey, async (key) => {
       const toCur = customer.receive_currency;
-      return move({ type: 'cash_in', fromAcc: await ensureWallet(agent.id, from), toAcc: await ensureWallet(customer.id, toCur),
+      const txId = await move({ type: 'cash_in', fromAcc: await ensureWallet(agent.id, from), toAcc: await ensureWallet(customer.id, toCur),
         quote: await quoteOr(agent, quoteId, 'cash_in', `${customer.id}|${toCur}|${amount}`,
           () => buildQuote({ amount, from, to: toCur, feeKind: feeKindBetween(agent, customer, from, toCur) })),
         note: 'Depósito no agente ' + agent.name, createdBy: agent.id, idemKey: key, expectedTo });
+      const r = await rates();
+      const c = C.AGENT_COMMISSION;
+      await payCommission(agent, from, Math.min(Math.round(amount * c.cashInRate), fromEur(c.cashInMaxEur, from, r)), 'depósito');
+      return txId;
     });
     if (!res.replayed) await audit(agent.id, 'cash_in', { tx: res.transaction.id, customer: customer.id, amount }, ip);
     return res;
@@ -625,10 +700,25 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
         quote: await cashoutQuote(c.amount, c.currency, c.from_currency),
         note: 'Levantamento no agente ' + agent.name, createdBy: agent.id });
       await db.run("UPDATE cashout_codes SET status = 'used', agent_id = ?, tx_id = ? WHERE id = ?", agent.id, id, c.id);
+      const t = await db.get('SELECT fee, currency FROM transactions WHERE id = ?', id);
+      // A comissão é paga na moeda em que o agente trabalha.
+      const r = await rates();
+      const feeInAgentCur = t.currency === c.currency ? t.fee : Math.round(t.fee * r[c.currency] / r[t.currency]);
+      await payCommission(agent, c.currency, Math.round(feeInAgentCur * C.AGENT_COMMISSION.cashOutShare), 'levantamento');
       return id;
     });
+    afterCommit(txId);
     await audit(agent.id, 'cash_out', { tx: txId, customer: customer.id, amount: c.amount }, ip);
     return { transaction: await txView(txId, agent), pay_cash: c.amount, currency: c.currency, customer: { name: customer.name, phone: customer.phone } };
+  }
+
+  // Comissão do agente: a empresa paga-a a partir das taxas dessa moeda.
+  async function payCommission(agent, currency, amount, what) {
+    if (!amount || amount < 1 || agent.role !== 'agent') return null;
+    const fees = await internal('fees', currency);
+    const wallet = await ensureWallet(agent.id, currency);
+    return recordTx({ type: 'commission', fromAcc: fees, toAcc: wallet, amount, currency, toAmount: amount, toCurrency: currency,
+      note: `Comissão de ${what}`, createdBy: agent.id, credits: [[fees.id, -amount], [wallet.id, amount]] });
   }
 
   // ---------- Administração ----------
@@ -937,6 +1027,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
         received, cleanText(bankReference, 80), t, admin.id, now(), r.id);
       return t;
     });
+    afterCommit(txId);
     await audit(admin.id, 'bank_deposit_confirmed', { id, tx: txId }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', txId), { forAdmin: true });
   }
@@ -949,6 +1040,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
       credits: [[payout.id, -r.amount], [float.id, r.amount]] });
     await db.run("UPDATE bank_requests SET status = 'completed', bank_reference = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
       bankReference, t, handledBy ?? null, now(), r.id);
+    return t;
   }
 
   async function rejectRequestCore(r, actorId, why, handledBy) {
@@ -956,6 +1048,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, actorId, `Pagamento recusado: ${why}`);
     await db.run("UPDATE bank_requests SET status = 'rejected', note = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
       why, txId, handledBy ?? null, now(), r.id);
+    return txId;
   }
 
   // O admin já fez a transferência para o IBAN.
@@ -964,7 +1057,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     const ref = cleanText(bankReference, 80);
     if (!ref) throw new ApiError(400, 'bad_reference', 'Indique a referência da transferência feita no banco.');
     await checkPin(admin, pin, ip);
-    await db.tx(async () => finishPayout(await lockedRequest(id, " AND kind = 'withdrawal'"), admin.id, ref, admin.id));
+    afterCommit(await db.tx(async () => finishPayout(await lockedRequest(id, " AND kind = 'withdrawal'"), admin.id, ref, admin.id)));
     await audit(admin.id, 'bank_withdrawal_paid', { id }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', Number(id)), { forAdmin: true });
   }
@@ -974,7 +1067,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     const why = cleanText(reason, 140);
     if (!why) throw new ApiError(400, 'bad_reason', 'Indique o motivo (o cliente vai vê-lo).');
     await checkPin(admin, pin, ip);
-    await db.tx(async () => rejectRequestCore(await lockedRequest(id), admin.id, why, admin.id));
+    afterCommit(await db.tx(async () => rejectRequestCore(await lockedRequest(id), admin.id, why, admin.id)));
     await audit(admin.id, 'bank_request_rejected', { id, why }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', Number(id)), { forAdmin: true });
   }
@@ -1011,10 +1104,13 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
       if (!r) throw new ApiError(404, 'not_found', 'Pagamento desconhecido.');
       if (r.status !== 'pending') return { id: r.id, status: r.status, duplicate: true };
       await db.run('UPDATE bank_requests SET provider_status = ? WHERE id = ?', status, r.id);
-      if (status === 'paid') await finishPayout(r, r.user_id, cleanText(bankRef, 80) || String(externalId), null);
-      else await rejectRequestCore(r, r.user_id, cleanText(reason, 120) || 'o banco recusou a transferência', null);
-      return { id: r.id, status: status === 'paid' ? 'completed' : 'rejected' };
+      const txId = status === 'paid'
+        ? await finishPayout(r, r.user_id, cleanText(bankRef, 80) || String(externalId), null)
+        : await rejectRequestCore(r, r.user_id, cleanText(reason, 120) || 'o banco recusou a transferência', null);
+      return { id: r.id, status: status === 'paid' ? 'completed' : 'rejected', txId };
     });
+    if (!result.duplicate) afterCommit(result.txId);
+    delete result.txId;
     await audit(null, 'payout_event', { provider, externalId, status, result });
     return result;
   }
@@ -1240,7 +1336,22 @@ function createService(db, { adminPhone, sandboxDelayMs, env } = {}) {
     return merchantCharge(merchant, id);
   }
 
+  // Ferramentas internas partilhadas com as funcionalidades extra (src/features/*).
+  const kit = {
+    db, C, rates, toEur, fromEur, fmt, now, startOfDay, audit, events, afterCommitHooks, afterCommit,
+    userById, userByPhone, walletOf, walletsOf, ensureWallet, internal, accountById, homeCurrency, findRecipient,
+    checkPin, requireRole, needCurrency, buildQuote, move, recordTx, idempotent, txView, transfer, publicUser,
+    limitsFor, sentTodayEur, createCashoutCode, history, OUTGOING, env, pushSender,
+    newSessionFor: async (u) => ({ token: await newSession(u.id), user: await publicUser(u) }),
+  };
+  const extra = {};
+  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts']) {
+    Object.assign(extra, require('./features/' + name)(kit));
+  }
+
   return {
+    ...extra,
+    requestOtp, resetPin, payCommission,
     register, login, logout, userFromToken, publicUser, changePin, setReceiveCurrency, lookup,
     quoteTransfer, quoteExchange, quoteRequest, quoteCashIn, quoteCashout,
     transfer, exchange, history, createRequest, listRequests, payRequest, closeRequest,

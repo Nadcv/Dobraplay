@@ -68,6 +68,29 @@ Se um envio **com câmbio** ultrapassar o limite, a app avisa o cliente **antes*
 
 Como cobrir a falta sem pausar envios: agentes que compram float (trazem dinheiro para o banco local), uma reserva inicial da empresa, ou uma linha de crédito do banco parceiro. **Nunca** com o dinheiro de outros clientes.
 
+## Segurança e conformidade
+
+- **Verificação do número por SMS**: criar conta e recuperar o PIN ("Esqueci o PIN") exigem um código de 6 dígitos enviado por SMS (válido 10 min, 5 tentativas, no máximo 5 SMS por hora por número). Recuperar o PIN termina as sessões noutros telemóveis. Sem fornecedor de SMS configurado, a app funciona em **modo de teste**: o código aparece no ecrã, com esse aviso.
+- **Face ID / impressão digital** (passkeys): entrar sem escrever o PIN. A chave privada nunca sai do telemóvel. Enviar dinheiro continua a pedir o PIN.
+- **Verificação de identidade (nível 2)**: o cliente envia a foto do documento e uma selfie (reduzidas no telemóvel). O admin compara e aprova em **Identidade**, e os limites sobem para 2 000 € por operação e 6 000 € por dia.
+- **Alertas antifraude / branqueamento** (ecrã **Alertas**): a app assinala automaticamente operações de 1 000 € ou mais, mais de 10 envios numa hora, envios repetidos perto do limite (fracionamento), contas com menos de 7 dias a enviar mais de 500 € em 24 h, e 5 ou mais pessoas diferentes a enviar para a mesma conta. O admin regista a conclusão e pode bloquear a conta. Os valores estão em `src/config.js → AML`.
+- **Relatórios**: exportação de todos os movimentos em CSV (abre no Excel) para a contabilidade ou para o banco central.
+
+## Para os clientes
+
+- **Notificações** no telemóvel: dinheiro recebido, pedidos, transferências bancárias concluídas, verificação de identidade. No iPhone funcionam com a app instalada no ecrã principal (iOS 16.4+). As chaves são geradas automaticamente.
+- **Comprovativos**: tocar num movimento mostra um recibo em imagem, que se partilha pelo WhatsApp ou se guarda.
+- **Envios automáticos mensais** (ex.: mesada): o cliente autoriza uma vez com o PIN, e o servidor envia no dia escolhido às 9h. Se faltar saldo, tenta nos 2 dias seguintes e avisa. Cada mês é pago uma única vez. ⚠️ No plano grátis do Render, o servidor adormece; o envio é feito quando acordar (ou mantenha-o acordado com o UptimeRobot).
+- **Recargas e contas**: recargas CST, Unitel STP, Unitel Angola e CV Móvel, energia pré-paga EMAE (dá o código para o contador) e fatura da água EMAE. Pode pagar-se a partir de qualquer carteira. Se a empresa recusar, o dinheiro volta. **Simulado** até haver contrato (ver `BILLS_HTTP_URL`).
+- **Agentes perto de mim**: lista dos agentes do mais perto para o mais longe, com ligação para o Google Maps e para telefonar.
+- **Idiomas**: Português, Español, English e Français. Escolhe-se no ecrã de entrada ou no perfil; por omissão segue o idioma do telemóvel. Os painéis de admin e agente ficam em português.
+- **USSD (`*xxx#`)** para telemóveis sem internet: ver saldo, enviar (com PIN), gerar código de levantamento e últimos movimentos. É compatível com gateways como o Africa's Talking (`POST /api/ussd?key=USSD_SECRET`). No painel de admin há um **simulador** para mostrar o menu a operadoras e parceiros.
+
+## Para os agentes
+
+- **O meu ponto**: nome, morada, horário e localização (botão "Usar a minha localização"), para aparecer aos clientes.
+- **Comissões automáticas**: 0,3% de cada depósito (até 3 €) e 40% da taxa de cada levantamento, pagas na hora pela empresa a partir das taxas. O ecrã **Comissões** mostra o total do mês.
+
 ## Câmbio garantido (60 segundos)
 
 Cada cotação mostrada ao cliente (enviar, câmbio, pagar numa loja, pedidos, depósitos de agentes, envios para IBAN) fica **garantida durante 60 segundos**, com uma contagem decrescente no ecrã. Se o cliente confirmar a tempo, paga exatamente o que viu, mesmo que o admin mude o câmbio entretanto. Depois disso, a app mostra uma cotação nova. Cada cotação só pode ser usada uma vez.
@@ -105,7 +128,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 26 testes automáticos (SQLite)
+npm test                            # 37 testes automáticos (SQLite)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
@@ -118,6 +141,11 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | `DB_FILE` | Sem `DATABASE_URL`, usa este ficheiro SQLite (por omissão `data/dobrapay.db`), só para o computador |
 | `ADMIN_PHONE` | Número da conta administradora |
 | `APP_NAME` | Nome da marca (por omissão DobraPay) |
+| `SMS_HTTP_URL` / `SMS_HTTP_TOKEN` | Fornecedor de SMS (`POST { to, message }`). Sem isto, os códigos aparecem no ecrã (modo de teste) |
+| `OTP_REQUIRED` | `false` desliga o código por SMS no registo (não recomendado) |
+| `USSD_SECRET` | Chave que o gateway USSD da operadora envia (`?key=` ou cabeçalho `X-USSD-Key`) |
+| `BILLS_HTTP_URL` / `BILLS_HTTP_TOKEN` | Fornecedor de recargas e contas. Sem isto, os pagamentos são simulados |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | Chaves das notificações (opcional: geradas e guardadas automaticamente) |
 | `PAYOUT_HTTP_URL` / `PAYOUT_HTTP_TOKEN` | Endereço e chave do parceiro de pagamentos por API (opcional) |
 | `PAYOUT_WEBHOOK_SECRET` | Segredo partilhado com o parceiro para assinar os webhooks (obrigatório para receber confirmações) |
 | `PAYOUT_SANDBOX_DELAY_MS` | Quanto tempo o simulador demora a "pagar" (por omissão 5000 ms) |
@@ -174,6 +202,10 @@ src/db.js          esquema e transações (SQLite no computador, PostgreSQL onli
 src/service.js     regras de negócio (contas, transferências, agentes, admin)
 src/app.js         API HTTP + segurança (rate limit, cabeçalhos, webhooks assinados)
 src/payouts.js     parceiros de pagamento (manual, simulador, API)
+src/features/      sms, push, kyc (identidade), aml (alertas + CSV), passkeys (Face ID),
+                   scheduled (envios mensais), bills (recargas/contas), agents (mapa + comissões),
+                   ussd, receipts (comprovativos)
+public/i18n.js     traduções (PT, ES, EN, FR)
 public/            app PWA (instalável no telemóvel)
 tests/             testes automáticos
 render.yaml        configuração do Render (publicar grátis)

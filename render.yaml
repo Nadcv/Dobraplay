@@ -27,3 +27,6 @@ services:
       # Segredo para os webhooks dos parceiros de pagamento (gerado pelo Render).
       - key: PAYOUT_WEBHOOK_SECRET
         generateValue: true
+      # Chave para o gateway USSD da operadora (gerada pelo Render).
+      - key: USSD_SECRET
+        generateValue: true

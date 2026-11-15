@@ -17,6 +17,7 @@ async function main() {
   const db = await openDb({ url, file });
   const service = createService(db, { adminPhone: process.env.ADMIN_PHONE, sandboxDelayMs: Number(process.env.PAYOUT_SANDBOX_DELAY_MS) || 5000 });
   const app = createApp(service);
+  service.startScheduler(); // envios automáticos mensais (verifica de minuto a minuto)
 
   const check = await service.ledgerCheck();
   if (!check.ok) console.error('⚠️  ATENÇÃO: o livro-razão não bate certo!', check);

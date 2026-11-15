@@ -22,7 +22,8 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
+const SCHEMA_VERSION = 6; // 6 = SMS, identidade, alertas, push, passkeys, envios automáticos, contas, agentes
+const _V5 = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
 const SCHEMA = `
@@ -68,7 +69,7 @@ const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS transactions (
     id               TEXT PRIMARY KEY,
-    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund')),
+    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission')),
     from_account     INTEGER NOT NULL REFERENCES accounts(id),
     to_account       INTEGER NOT NULL REFERENCES accounts(id),
     amount           INTEGER NOT NULL CHECK (amount > 0),     -- na moeda de origem
@@ -236,6 +237,129 @@ const SCHEMA = `
     updated_by     INTEGER
   );
 
+  -- Códigos de verificação por SMS (registo e recuperar o PIN).
+  CREATE TABLE IF NOT EXISTS otp_codes (
+    id          INTEGER PRIMARY KEY,
+    phone       TEXT NOT NULL,
+    purpose     TEXT NOT NULL,                    -- register / reset_pin
+    code_hash   TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    created_at  INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS otp_phone ON otp_codes(phone, purpose, created_at);
+
+  -- Verificação de identidade (nível 2): documento + selfie, revisto pelo admin.
+  CREATE TABLE IF NOT EXISTS kyc_requests (
+    id            INTEGER PRIMARY KEY,
+    user_id       INTEGER NOT NULL REFERENCES users(id),
+    full_name     TEXT NOT NULL,
+    doc_type      TEXT NOT NULL,                  -- bi, passaporte, autorizacao_residencia
+    doc_number    TEXT NOT NULL,
+    birth_date    TEXT NOT NULL,
+    doc_image     TEXT NOT NULL,                  -- imagem JPEG em data URL (reduzida no telemóvel)
+    selfie_image  TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+    note          TEXT,
+    reviewed_by   INTEGER REFERENCES users(id),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS kyc_status ON kyc_requests(status, created_at);
+
+  -- Alertas automáticos antifraude / branqueamento de capitais.
+  CREATE TABLE IF NOT EXISTS aml_alerts (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id),
+    rule         TEXT NOT NULL,
+    detail       TEXT NOT NULL,
+    tx_id        TEXT REFERENCES transactions(id),
+    status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+    note         TEXT,
+    reviewed_by  INTEGER REFERENCES users(id),
+    created_at   INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS aml_status ON aml_alerts(status, created_at);
+
+  -- Subscrições de notificações push (uma por telemóvel/navegador).
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint    TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    p256dh      TEXT NOT NULL,
+    auth        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+  );
+
+  -- Passkeys (Face ID / impressão digital) para entrar sem o PIN.
+  CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id          TEXT PRIMARY KEY,                 -- identificador da credencial (base64url)
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    public_key  TEXT NOT NULL,                    -- base64url
+    counter     INTEGER NOT NULL DEFAULT 0,
+    transports  TEXT,
+    label       TEXT,
+    created_at  INTEGER NOT NULL,
+    last_used   INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS webauthn_challenges (
+    id          TEXT PRIMARY KEY,
+    user_id     INTEGER,
+    challenge   TEXT NOT NULL,
+    purpose     TEXT NOT NULL,                    -- register / login
+    expires_at  INTEGER NOT NULL
+  );
+
+  -- Envios automáticos todos os meses (ex.: mesada).
+  CREATE TABLE IF NOT EXISTS scheduled_transfers (
+    id             INTEGER PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id),
+    to_phone       TEXT NOT NULL,
+    amount         INTEGER NOT NULL CHECK (amount > 0),
+    from_currency  TEXT NOT NULL,
+    note           TEXT,
+    day_of_month   INTEGER NOT NULL CHECK (day_of_month BETWEEN 1 AND 28),
+    next_run_at    INTEGER NOT NULL,
+    failures       INTEGER NOT NULL DEFAULT 0,
+    active         INTEGER NOT NULL DEFAULT 1,
+    last_status    TEXT,
+    last_run_at    INTEGER,
+    created_at     INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS sched_due ON scheduled_transfers(active, next_run_at);
+
+  -- Recargas de telemóvel e pagamento de contas (luz, água).
+  CREATE TABLE IF NOT EXISTS bill_payments (
+    id            INTEGER PRIMARY KEY,
+    user_id       INTEGER NOT NULL REFERENCES users(id),
+    biller        TEXT NOT NULL,
+    account_ref   TEXT NOT NULL,                  -- número de telemóvel, contador ou referência da fatura
+    amount        INTEGER NOT NULL CHECK (amount > 0),
+    currency      TEXT NOT NULL,
+    from_currency TEXT NOT NULL,
+    from_amount   INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','failed')),
+    token         TEXT,                           -- ex.: código de energia pré-paga
+    provider_ref  TEXT,
+    note          TEXT,
+    tx_id         TEXT REFERENCES transactions(id),
+    final_tx_id   TEXT REFERENCES transactions(id),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+
+  -- Perfil público dos agentes (para o mapa "agentes perto de mim").
+  CREATE TABLE IF NOT EXISTS agent_profiles (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id),
+    business    TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    hours       TEXT,
+    lat         REAL NOT NULL,
+    lng         REAL NOT NULL,
+    cash_available INTEGER NOT NULL DEFAULT 1,
+    updated_at  INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY,
     user_id  INTEGER,
@@ -385,6 +509,14 @@ const MIGRATIONS = {
       ALTER TABLE bank_requests ADD COLUMN external_id TEXT;
       ALTER TABLE bank_requests ADD COLUMN provider_status TEXT;
     `,
+  },
+  6: {
+    postgres: `
+      ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
+      ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
+        CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission'));
+    `,
+    sqlite: null,
   },
 };
 

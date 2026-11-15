@@ -15,7 +15,7 @@ const prettyPhone = (p) => {
   return `+${c.dial} ${p.slice(c.dial.length + 1).replace(/(\d{3})(?=\d{3,})/g, '$1 ')}`;
 };
 const flagOf = (country) => (CFG.countries[country] || {}).flag || '';
-const when = (t) => new Date(t).toLocaleString('pt-PT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+const when = (ts) => new Date(ts).toLocaleString(typeof LANG !== 'undefined' && LANG !== 'pt' ? LANG : 'pt-PT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 const newKey = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
 const debounce = (fn, ms = 350) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
@@ -163,14 +163,29 @@ function attachLookup(form, field) {
 }
 
 // ---------------- Autenticação ----------------
+// Modos: login, register (2 passos: código por SMS e depois criar a conta) e reset (esqueci o PIN).
 let authMode = 'login';
-document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => {
-  authMode = b.dataset.tab;
-  document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('active', x === b));
-  document.querySelectorAll('[data-only="register"]').forEach((el) => { el.hidden = authMode !== 'register'; });
-  $('#authForm button[type=submit]').textContent = authMode === 'login' ? 'Entrar' : 'Criar conta';
-  $('#authForm [name=pin]').autocomplete = authMode === 'login' ? 'current-password' : 'new-password';
-}));
+let codeSent = false;
+function setAuthMode(mode) {
+  authMode = mode; codeSent = false;
+  const form = $('#authForm');
+  document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('active', x.dataset.tab === mode));
+  $('.tabs').hidden = mode === 'reset';
+  form.querySelectorAll('[data-only]').forEach((el) => {
+    const only = el.dataset.only;
+    el.hidden = only === 'register' ? mode !== 'register' : only === 'reset' ? mode !== 'reset' : only === 'code' ? true : only === 'pin' ? mode === 'reset' : el.hidden;
+  });
+  $('[data-devcode]', form).hidden = true;
+  $('[data-pinlabel]', form).textContent = t(mode === 'reset' ? 'Novo PIN (4 a 6 dígitos)' : 'PIN (4 a 6 dígitos)');
+  form.pin.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+  form.querySelector('button[type=submit]').textContent = t(mode === 'login' ? 'Entrar' : 'Enviar código por SMS');
+  $('[data-forgot]', form).hidden = mode !== 'login';
+  $('[data-backlogin]', form).hidden = mode !== 'reset';
+  $('[data-passkey-login]', form).hidden = mode !== 'login' || !window.PublicKeyCredential;
+}
+document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => setAuthMode(b.dataset.tab)));
+$('[data-forgot]').addEventListener('click', (e) => { e.preventDefault(); setAuthMode('reset'); });
+$('[data-backlogin]').addEventListener('click', (e) => { e.preventDefault(); setAuthMode('login'); });
 
 function setupAuthCountry() {
   const sel = $('#authCountry');
@@ -185,23 +200,73 @@ function setupAuthCountry() {
   sync();
 }
 
+function signedIn(r, country) {
+  state.token = r.token;
+  localStorage.setItem('dp_token', r.token);
+  if (country) localStorage.setItem('dp_country', country);
+  $('#authForm').reset();
+  setAuthMode('login');
+  state.me = r.user;
+  showHome();
+}
+
 $('#authForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const f = new FormData(e.target);
-  const btn = e.target.querySelector('button[type=submit]');
+  const form = e.target;
+  const f = new FormData(form);
+  const btn = form.querySelector('button[type=submit]');
   btn.disabled = true;
   try {
-    const body = { phone: f.get('phone'), pin: f.get('pin'), country: f.get('country') };
-    if (authMode === 'register') body.name = f.get('name');
-    const r = await api('POST', '/auth/' + authMode, body);
-    state.token = r.token;
-    localStorage.setItem('dp_token', r.token);
-    localStorage.setItem('dp_country', f.get('country'));
-    e.target.reset();
-    state.me = r.user;
-    showHome();
-  } catch (err) { toast(err.message, true); }
+    if (authMode === 'login') {
+      const r = await api('POST', '/auth/login', { phone: f.get('phone'), pin: f.get('pin'), country: f.get('country') });
+      return signedIn(r, f.get('country'));
+    }
+    if (!codeSent) {
+      // Passo 1: pede o código por SMS.
+      if (authMode === 'register' && !f.get('name')) throw new Error(t('Indique o seu nome completo.'));
+      const o = await api('POST', '/auth/otp', { phone: f.get('phone'), country: f.get('country'), purpose: authMode === 'register' ? 'register' : 'reset_pin' });
+      codeSent = true;
+      form.querySelector('[data-only=code]').hidden = false;
+      form.querySelector('[data-only=pin]').hidden = false;
+      const dev = $('[data-devcode]', form);
+      dev.hidden = !o.dev_code;
+      if (o.dev_code) dev.textContent = t('Modo de teste (sem SMS): o seu código é {code}', { code: o.dev_code });
+      btn.textContent = t(authMode === 'register' ? 'Criar conta' : 'Guardar novo PIN');
+      toast(t('Enviámos um código por SMS para {phone}.', { phone: prettyPhone(o.phone) }));
+      form.code.focus();
+      return;
+    }
+    // Passo 2: cria a conta / muda o PIN com o código.
+    const r = authMode === 'register'
+      ? await api('POST', '/auth/register', { phone: f.get('phone'), name: f.get('name'), pin: f.get('pin'), country: f.get('country'), code: f.get('code') })
+      : await api('POST', '/auth/reset-pin', { phone: f.get('phone'), country: f.get('country'), code: f.get('code'), newPin: f.get('pin') });
+    if (authMode === 'reset') toast(t('PIN alterado. Já entrou na sua conta.'));
+    signedIn(r, f.get('country'));
+  } catch (err) { toast(errText(err), true); }
   finally { btn.disabled = false; }
+});
+
+// Face ID / impressão digital (passkeys). A biblioteca só é carregada quando é precisa.
+function loadWebAuthn() {
+  if (window.SimpleWebAuthnBrowser) return Promise.resolve(window.SimpleWebAuthnBrowser);
+  return new Promise((resolve, reject) => {
+    const sc = document.createElement('script');
+    sc.src = '/vendor/webauthn.js';
+    sc.onload = () => resolve(window.SimpleWebAuthnBrowser);
+    sc.onerror = () => reject(new Error(t('Não foi possível carregar o Face ID. Verifique a ligação.')));
+    document.head.append(sc);
+  });
+}
+$('[data-passkey-login]').addEventListener('click', async () => {
+  try {
+    const wa = await loadWebAuthn();
+    const o = await api('POST', '/auth/passkey/options');
+    const response = await wa.startAuthentication({ optionsJSON: o.options });
+    signedIn(await api('POST', '/auth/passkey', { challenge_id: o.challenge_id, response }));
+  } catch (err) {
+    if (err && err.name === 'NotAllowedError') return; // a pessoa cancelou
+    toast(errText(err), true);
+  }
 });
 
 function logoutLocal() {
@@ -234,7 +299,11 @@ async function refresh() {
     renderMe();
     renderHistory(txs);
     renderPending(reqs, bank);
-    if (me.role === 'admin') api('GET', '/admin/bank/requests').then((r) => { $('#bankBadge').textContent = r.length || ''; }).catch(() => {});
+    if (me.role === 'admin') {
+      api('GET', '/admin/bank/requests').then((r) => { $('#bankBadge').textContent = r.length || ''; }).catch(() => {});
+      api('GET', '/admin/kyc').then((r) => { $('#kycBadge').textContent = r.length || ''; }).catch(() => {});
+      api('GET', '/admin/alerts').then((r) => { $('#alertBadge').textContent = r.length || ''; }).catch(() => {});
+    }
   } catch (err) { if (state.token) toast(err.message, true); }
 }
 
@@ -260,8 +329,8 @@ $('#balance').addEventListener('click', () => {
 });
 
 const TX_LABEL = { p2p: 'Transferência', request: 'Pedido pago', cash_in: 'Depósito', cash_out: 'Levantamento', issue: 'Float emitido', exchange: 'Câmbio',
-  bank_in: 'Carregamento por banco', bank_out: 'Para conta bancária', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
-const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄', bank_in: '🏦', bank_out: '🏦', merchant: '🛒', refund: '↩', settlement: '🏦' };
+  bank_in: 'Carregamento por banco', bill: 'Recarga / conta', commission: 'Comissão', bank_out: 'Para conta bancária', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
+const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄', bank_in: '🏦', bank_out: '🏦', bill: '💡', commission: '💰', merchant: '🛒', refund: '↩', settlement: '🏦' };
 
 function renderHistory(txs) {
   const ul = $('#history');
@@ -282,13 +351,14 @@ function renderHistory(txs) {
     }
     const conv = t.currency !== t.to_currency && t.direction !== 'self'
       ? ` · ${t.direction === 'out' ? 'recebeu ' + money(t.to_amount, t.to_currency) : 'enviou ' + money(t.amount, t.currency)}` : '';
-    return `<li>
+    return `<li data-tx="${esc(t.id)}" style="cursor:pointer">
       <span class="tx-ico">${TX_ICON[t.type] || '•'}</span>
       <span class="tx-main"><strong>${esc(title)}</strong>
         <small>${esc(TX_LABEL[t.type])} · ${esc(when(t.created_at))}${esc(conv)}${t.note ? ' · ' + esc(t.note) : ''}</small></span>
       <span class="tx-amt ${cls}" style="text-align:right">${amt}</span>
     </li>`;
   }).join('');
+  ul.querySelectorAll('[data-tx]').forEach((li) => li.addEventListener('click', () => openSheet('receipt', li.dataset.tx)));
 }
 
 function renderPending(reqs, bank = []) {
@@ -325,6 +395,7 @@ const SHEETS = {
   send: (pre = {}) => ({
     title: 'Enviar dinheiro',
     html: `<form>
+      <button type="button" class="choice" data-go="scheduled" style="padding:10px 14px"><span>🔁</span><div><strong>${t('Envio automático todos os meses')}</strong><small>${t('Ex.: mesada para a família')}</small></div></button>
       <button type="button" class="choice" data-go="sendBank" style="padding:10px 14px"><span>🏦</span><div><strong>Para uma conta bancária (IBAN)</strong><small>Para quem ainda não tem DobraPay</small></div></button>
       ${phoneField('to', 'Para (número)', pre.to)}
       ${'BarcodeDetector' in window ? '<button type="button" class="btn small" data-scan style="margin:-6px 0 14px">📷 Ler QR code</button>' : ''}
@@ -520,11 +591,13 @@ const SHEETS = {
   topup: () => ({
     title: 'Carregar a carteira',
     html: `<button type="button" class="choice" data-go="bankin"><span>🏦</span><div><strong>Por transferência bancária</strong><small>Do seu banco para a conta da DobraPay (ex.: MB Way/homebanking em Portugal, BISTP em São Tomé).</small></div></button>
+      <button type="button" class="choice" data-go="agentsNear"><span>📍</span><div><strong>${t('Agentes perto de mim')}</strong><small>${t('Onde depositar ou levantar dinheiro')}</small></div></button>
       <button type="button" class="choice" data-go="agentInfo"><span>🧑🏾‍💼</span><div><strong>Em dinheiro, num agente</strong><small>Entregue o dinheiro a um agente DobraPay e ele carrega a sua carteira na hora.</small></div></button>`,
   }),
   withdraw: () => ({
     title: 'Levantar dinheiro',
     html: `<button type="button" class="choice" data-go="cashout"><span>💵</span><div><strong>Em dinheiro, num agente</strong><small>Gere um código e receba o dinheiro em mão.</small></div></button>
+      <button type="button" class="choice" data-go="agentsNear"><span>📍</span><div><strong>${t('Agentes perto de mim')}</strong><small>${t('Onde depositar ou levantar dinheiro')}</small></div></button>
       <button type="button" class="choice" data-go="bankout"><span>🏦</span><div><strong>Para a minha conta bancária</strong><small>Transferência para o seu IBAN (Portugal, Espanha, São Tomé, Angola, Cabo Verde…).</small></div></button>`,
   }),
   agentInfo: () => ({
@@ -834,6 +907,283 @@ const SHEETS = {
     },
   }),
 
+
+  // ---------- Comprovativo ----------
+  receipt: (id) => ({
+    title: t('Comprovativo'),
+    html: `<div data-rc><p class="hint">${t('A carregar…')}</p></div>`,
+    setup: async (root) => {
+      const tx = await api('GET', `/transactions/${encodeURIComponent(id)}`);
+      const canvas = drawReceipt(tx);
+      const url = canvas.toDataURL('image/png');
+      $('[data-rc]', root).innerHTML = `<img class="receipt-img" src="${url}" alt="${esc(t('Comprovativo'))}">
+        <button type="button" class="btn primary" data-share>📤 ${t('Partilhar comprovativo')}</button>
+        <a class="btn" style="display:block;text-align:center;margin-top:8px;text-decoration:none" download="comprovativo-${esc(tx.id.slice(0, 8))}.png" href="${url}">⬇ ${t('Guardar imagem')}</a>`;
+      $('[data-share]', root).addEventListener('click', async () => {
+        const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+        const file = new File([blob], `comprovativo-${tx.id.slice(0, 8)}.png`, { type: 'image/png' });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          navigator.share({ files: [file], title: t('Comprovativo DobraPay') }).catch(() => {});
+        } else { toast(t('Use "Guardar imagem" e envie pelo WhatsApp.')); }
+      });
+    },
+  }),
+
+  // ---------- Envios automáticos ----------
+  scheduled: () => ({
+    title: t('Envios automáticos'),
+    html: `<div data-list></div>
+      <form><h3 style="font-size:1rem">${t('Novo envio todos os meses')}</h3>
+      ${phoneField('to', t('Para (número)'))}
+      <div class="row">${amountField(t('Valor'))}<label>${t('Dia do mês')}<input name="day_of_month" type="number" min="1" max="28" value="1" required></label></div>
+      ${fromWalletField(t('Da carteira'))}
+      <label>${t('Mensagem (opcional)')}<input name="note" maxlength="140" placeholder="${esc(t('Ex.: mesada'))}"></label>
+      <p class="hint">${t('Enviamos automaticamente nesse dia, às 9h. Se faltar saldo, tentamos nos dias seguintes e avisamos.')}</p>
+      ${pinField}<button class="btn primary">${t('Agendar')}</button></form>`,
+    lookup: 'to',
+    setup: async (root) => {
+      const render = (list) => {
+        $('[data-list]', root).innerHTML = list.length ? list.map((x) => `<div class="req-card"><div class="copy-row"><div>
+          <strong>${esc(money(x.amount, x.from_currency))} → ${esc(x.to_name || prettyPhone(x.to_phone))}</strong>
+          <small>${t('Todos os meses, dia {d} · próximo: {date}', { d: x.day_of_month, date: new Date(x.next_run_at).toLocaleDateString(LANG) })}${x.last_status && x.last_status !== 'ok' ? ' · ⚠️ ' + esc(x.last_status) : ''}</small></div>
+          <button type="button" class="btn small danger" data-del="${x.id}">${t('Parar')}</button></div></div>`).join('') : `<p class="hint">${t('Ainda não tem envios automáticos.')}</p>`;
+        root.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => render(await api('DELETE', `/scheduled/${b.dataset.del}`))));
+      };
+      render(await api('GET', '/scheduled'));
+    },
+    submit: async (f, key, form) => {
+      await api('POST', '/scheduled', { to: fullPhone(form, 'to'), amount: f.get('amount'), day_of_month: Number(f.get('day_of_month')),
+        from_currency: f.get('from_currency'), note: f.get('note'), pin: f.get('pin') });
+      toast(t('Envio automático agendado.'));
+      openSheet('scheduled');
+    },
+  }),
+
+  // ---------- Recargas e contas ----------
+  bills: () => ({
+    title: t('Recargas e contas'),
+    html: `<form><label>${t('Serviço')}<select name="biller"></select></label>
+      <label><span data-reflabel>${t('Referência')}</span><input name="account_ref" required></label>
+      ${amountField(t('Valor'))}${fromWalletField(t('Pagar com'))}${quoteBox}${pinField}
+      <p class="hint" data-sim hidden>${t('Modo de demonstração: os pagamentos são simulados até haver contrato com cada empresa.')}</p>
+      <button class="btn primary">${t('Pagar')}</button></form><div data-history></div>`,
+    setup: async (root) => {
+      const form = $('form', root);
+      const [billers, past] = await Promise.all([api('GET', '/bills/billers'), api('GET', '/bills')]);
+      const mine = billers.filter((b) => b.country === state.me.country).concat(billers.filter((b) => b.country !== state.me.country));
+      form.biller.innerHTML = mine.map((b) => `<option value="${b.id}">${esc(b.name)} (${b.currency})</option>`).join('');
+      const sync = () => {
+        const b = billers.find((x) => x.id === form.biller.value);
+        $('[data-reflabel]', root).textContent = t(b.ref_label);
+        form.account_ref.placeholder = b.ref === 'phone' ? CFG.countries[b.country].example : '';
+        form.amount.placeholder = t('mínimo {v}', { v: money(b.min, b.currency) });
+      };
+      form.biller.addEventListener('change', sync); sync();
+      $('[data-sim]', root).hidden = !billers.some((b) => b.simulated);
+      $('[data-history]', root).innerHTML = past.length ? `<h3 style="font-size:1rem">${t('Últimos pagamentos')}</h3>` + past.map((p) => `<div class="req-card"><div class="copy-row"><div>
+        <strong>${esc(p.biller_name)} · ${esc(money(p.amount, p.currency))}</strong><small>${esc(p.account_ref)} · ${esc(when(p.created_at))}${p.token ? ` · ${t('código')}: <b>${esc(p.token)}</b>` : ''}</small></div>
+        <span class="tag ${p.status === 'failed' ? 'rejected' : p.status}">${esc(t(STATUS[p.status] || p.status))}</span></div></div>`).join('') : '';
+    },
+    quote: (f) => api('GET', '/quote/bill?' + qs({ biller: f.get('biller'), amount: f.get('amount'), from_currency: f.get('from_currency') })),
+    quoteOpts: { payLabel: 'Paga', getLabel: 'A empresa recebe' },
+    submit: async (f, key) => {
+      const r = await api('POST', '/bills', { biller: f.get('biller'), account_ref: f.get('account_ref'), amount: f.get('amount'),
+        from_currency: f.get('from_currency'), pin: f.get('pin'), idempotency_key: key });
+      const p = r.payment;
+      if (p.status === 'completed' && p.token) {
+        $('#sheetContent').innerHTML = `<div class="center"><p>${t('Código de energia para introduzir no contador:')}</p><div class="big-code" style="font-size:1.6rem;letter-spacing:2px">${esc(p.token)}</div>
+          <button type="button" class="btn primary" data-close>${t('Fechar')}</button></div>`;
+        bindClose(); refresh(); return;
+      }
+      if (p.status === 'failed') { toast(t('Não foi possível pagar: {why}. O dinheiro voltou à carteira.', { why: p.note }), true); refresh(); return; }
+      done(t('{name} paga ✓', { name: p.biller_name }));
+    },
+  }),
+
+  // ---------- Agentes ----------
+  agentsNear: () => ({
+    title: t('Agentes perto de mim'),
+    html: `<p class="hint" data-msg>${t('A procurar a sua localização…')}</p><div data-list></div>`,
+    setup: async (root) => {
+      const render = (list) => {
+        $('[data-list]', root).innerHTML = list.length ? list.map((a) => `<div class="agent-card"><strong>${flagOf(a.country)} ${esc(a.name)}</strong>
+          ${esc(a.address)}${a.hours ? ' · ' + esc(a.hours) : ''}<br>
+          <small>${a.distance_km != null ? `📍 ${a.distance_km} km · ` : ''}${t('paga em')} ${esc(a.currency)} · ${esc(prettyPhone(a.phone))}${a.cash_available ? '' : ' · ⚠️ ' + t('sem dinheiro vivo agora')}</small>
+          <div class="row" style="margin-top:8px"><a class="btn small" href="${esc(a.maps_url)}" target="_blank" rel="noopener">🗺 ${t('Ver no mapa')}</a><a class="btn small" href="tel:${esc(a.phone)}">📞 ${t('Ligar')}</a></div></div>`).join('')
+          : `<p class="empty">${t('Ainda não há agentes registados aqui.')}</p>`;
+      };
+      const byCountry = async () => { $('[data-msg]', root).textContent = t('Agentes no seu país:'); render(await api('GET', '/agents/nearby')); };
+      if (!navigator.geolocation) return byCountry();
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        $('[data-msg]', root).textContent = t('Do mais perto para o mais longe:');
+        render(await api('GET', '/agents/nearby?' + qs({ lat: pos.coords.latitude, lng: pos.coords.longitude })));
+      }, byCountry, { timeout: 8000, maximumAge: 300000 });
+    },
+  }),
+
+  agentProfile: () => ({
+    title: 'O meu ponto de atendimento',
+    html: `<form><p class="hint" style="margin-top:0">Aparece aos clientes em "Agentes perto de mim".</p>
+      <label>Nome do estabelecimento<input name="business" maxlength="60" required></label>
+      <label>Morada<input name="address" maxlength="120" required></label>
+      <label>Horário<input name="hours" maxlength="60" placeholder="Ex.: seg–sáb 8h–20h"></label>
+      <div class="row"><label>Latitude<input name="lat" inputmode="decimal" required></label><label>Longitude<input name="lng" inputmode="decimal" required></label></div>
+      <button type="button" class="btn small" data-geo style="margin:-6px 0 14px">📍 Usar a minha localização</button>
+      <label class="check"><input type="checkbox" name="cash_available" checked> Tenho dinheiro vivo para levantamentos</label>
+      <button class="btn primary">Guardar</button></form>`,
+    setup: async (root) => {
+      const form = $('form', root);
+      $('[data-geo]', root).addEventListener('click', () => navigator.geolocation.getCurrentPosition(
+        (p) => { form.lat.value = p.coords.latitude.toFixed(5); form.lng.value = p.coords.longitude.toFixed(5); },
+        () => toast('Não foi possível obter a localização. Autorize o acesso ou escreva as coordenadas.', true), { timeout: 10000 }));
+      const { profile } = await api('GET', '/agent/profile');
+      if (profile) { for (const k of ['business', 'address', 'hours', 'lat', 'lng']) form[k].value = profile[k] ?? ''; form.cash_available.checked = profile.cash_available; }
+    },
+    submit: async (f) => {
+      await api('POST', '/agent/profile', { business: f.get('business'), address: f.get('address'), hours: f.get('hours'),
+        lat: Number(String(f.get('lat')).replace(',', '.')), lng: Number(String(f.get('lng')).replace(',', '.')), cash_available: !!f.get('cash_available') });
+      done('Ponto de atendimento guardado.');
+    },
+  }),
+
+  agentStats: () => ({
+    title: 'As minhas comissões',
+    html: '<div data-st><p class="hint">A carregar…</p></div>',
+    setup: async (root) => {
+      const s = await api('GET', '/agent/stats');
+      $('[data-st]', root).innerHTML = `<p class="hint" style="margin-top:0">Desde ${esc(new Date(s.since).toLocaleDateString('pt-PT'))}. Ganha 0,3% de cada depósito (até 3 €) e 40% da taxa de cada levantamento.</p>
+        <div class="stat-grid"><div><small>Depósitos</small><strong>${s.cash_in}</strong></div><div><small>Levantamentos</small><strong>${s.cash_out}</strong></div></div>
+        <div class="summary">${s.commissions.length ? s.commissions.map((c) => `<div><span>Comissões (${c.count})</span><strong>${esc(money(c.total, c.currency))}</strong></div>`).join('') : '<div><span>Comissões</span><span>0</span></div>'}</div>`;
+    },
+  }),
+
+  // ---------- Verificação de identidade ----------
+  kyc: () => ({
+    title: t('Verificar identidade'),
+    html: `<form><p class="hint" style="margin-top:0">${t('Com a identidade verificada (nível 2), os seus limites sobem para 2 000 € por operação e 6 000 € por dia.')}</p>
+      <label>${t('Nome completo (como no documento)')}<input name="full_name" maxlength="80" required value="${esc(state.me.name)}"></label>
+      <label>${t('Documento')}<select name="doc_type"><option value="bi">${t('Bilhete de identidade')}</option><option value="cartao_cidadao">${t('Cartão de cidadão')}</option><option value="passaporte">${t('Passaporte')}</option><option value="residencia">${t('Autorização de residência')}</option></select></label>
+      <div class="row"><label>${t('Número')}<input name="doc_number" maxlength="30" required></label><label>${t('Data de nascimento')}<input name="birth_date" type="date" required></label></div>
+      <label>📄 ${t('Foto do documento')}<input type="file" accept="image/*" capture="environment" data-img="doc" required></label><img class="kyc-preview" data-prev="doc" hidden alt="">
+      <label>🤳 ${t('Selfie (a sua cara, bem iluminada)')}<input type="file" accept="image/*" capture="user" data-img="selfie" required></label><img class="kyc-preview" data-prev="selfie" hidden alt="">
+      <button class="btn primary">${t('Enviar para verificação')}</button></form>`,
+    setup: (root) => {
+      const form = $('form', root);
+      form._imgs = {};
+      root.querySelectorAll('[data-img]').forEach((input) => input.addEventListener('change', async () => {
+        const file = input.files[0];
+        if (!file) return;
+        try {
+          const data = await shrinkImage(file, 1000, 0.75);
+          form._imgs[input.dataset.img] = data;
+          const prev = $(`[data-prev=${input.dataset.img}]`, root); prev.src = data; prev.hidden = false;
+        } catch { toast(t('Não foi possível ler a imagem. Tire a foto de novo.'), true); }
+      }));
+    },
+    submit: async (f, key, form) => {
+      if (!form._imgs.doc || !form._imgs.selfie) throw new Error(t('Tire a foto do documento e a selfie.'));
+      await api('POST', '/me/kyc', { full_name: f.get('full_name'), doc_type: f.get('doc_type'), doc_number: f.get('doc_number'),
+        birth_date: f.get('birth_date'), doc_image: form._imgs.doc, selfie_image: form._imgs.selfie });
+      done(t('Enviado! Vamos analisar e avisamos assim que estiver verificado.'));
+    },
+  }),
+
+  // ---------- Admin: identidade, alertas, relatórios, USSD ----------
+  kycAdmin: () => ({
+    title: 'Verificações de identidade',
+    html: '<label>O seu PIN (para confirmar)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label><div data-list><p class="hint">A carregar…</p></div>',
+    setup: async (root) => {
+      const load = async () => {
+        const list = await api('GET', '/admin/kyc');
+        $('#kycBadge').textContent = list.length || '';
+        $('[data-list]', root).innerHTML = list.map((k) => `<div class="req-card" data-id="${k.id}">
+          <strong>${flagOf(k.user.country)} ${esc(k.full_name)}</strong><small> · conta: ${esc(k.user.name)} · ${esc(prettyPhone(k.user.phone))}</small>
+          <div class="summary" style="margin:8px 0"><div><span>${esc(k.doc_type_label)}</span><span>${esc(k.doc_number)}</span></div><div><span>Nascimento</span><span>${esc(k.birth_date)}</span></div></div>
+          <div class="kyc-imgs"><img src="${esc(k.doc_image)}" alt="Documento"><img src="${esc(k.selfie_image)}" alt="Selfie"></div>
+          <div class="row"><button type="button" class="btn small primary" data-ok>Aprovar (nível 2)</button><button type="button" class="btn small danger" data-no>Recusar</button></div></div>`).join('')
+          || '<p class="empty">Não há verificações pendentes. ✓</p>';
+        root.querySelectorAll('.req-card').forEach((card) => {
+          const go = async (approve, note) => {
+            try { await api('POST', `/admin/kyc/${card.dataset.id}`, { approve, note, pin: $('[data-adminpin]', root).value }); toast(approve ? 'Aprovado.' : 'Recusado.'); load(); }
+            catch (err) { toast(err.message, true); }
+          };
+          $('[data-ok]', card).addEventListener('click', () => go(true));
+          $('[data-no]', card).addEventListener('click', () => { const n = prompt('Motivo da recusa (o cliente vai ver):'); if (n) go(false, n); });
+        });
+      };
+      await load();
+    },
+  }),
+
+  alerts: () => ({
+    title: 'Alertas antifraude',
+    html: '<label>O seu PIN (para confirmar)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label><div data-list><p class="hint">A carregar…</p></div>',
+    setup: async (root) => {
+      const render = (list) => {
+        $('#alertBadge').textContent = list.length || '';
+        $('[data-list]', root).innerHTML = list.map((a) => `<div class="req-card" data-id="${a.id}">
+          <strong>⚠️ ${esc(a.rule_label)}</strong><br><small>${esc(a.detail)} · ${esc(when(a.created_at))}</small><br>
+          <small>${flagOf(a.user.country)} ${esc(a.user.name)} · ${esc(prettyPhone(a.user.phone))} · nível ${a.user.tier}${a.user.status === 'blocked' ? ' · BLOQUEADO' : ''}</small>
+          <input data-note placeholder="Conclusão da análise" style="margin-top:8px">
+          <div class="row" style="margin-top:8px"><button type="button" class="btn small" data-close-alert>Fechar alerta</button><button type="button" class="btn small danger" data-block>Fechar e bloquear conta</button></div></div>`).join('')
+          || '<p class="empty">Sem alertas abertos. ✓</p>';
+        root.querySelectorAll('.req-card').forEach((card) => {
+          const go = async (block) => {
+            try { render(await api('POST', `/admin/alerts/${card.dataset.id}/close`, { note: $('[data-note]', card).value, block_user: block, pin: $('[data-adminpin]', root).value })); toast('Alerta fechado.'); }
+            catch (err) { toast(err.message, true); }
+          };
+          $('[data-close-alert]', card).addEventListener('click', () => go(false));
+          $('[data-block]', card).addEventListener('click', () => go(true));
+        });
+      };
+      render(await api('GET', '/admin/alerts'));
+    },
+  }),
+
+  reports: () => ({
+    title: 'Relatórios',
+    html: `<form><p class="hint" style="margin-top:0">Exporta todos os movimentos (CSV para Excel) para a contabilidade ou para o banco central.</p>
+      <div class="row"><label>De<input name="from" type="date" required></label><label>Até<input name="to" type="date" required></label></div>
+      <button class="btn primary">⬇ Exportar CSV</button></form>`,
+    setup: (root) => {
+      const f = $('form', root), d = new Date();
+      f.to.value = d.toISOString().slice(0, 10);
+      f.from.value = new Date(d - 30 * 86400000).toISOString().slice(0, 10);
+    },
+    submit: async (f) => {
+      const res = await fetch('/api/admin/export.csv?' + qs({ from: f.get('from'), to: f.get('to') }), { headers: { authorization: 'Bearer ' + state.token } });
+      if (!res.ok) throw new Error('Não foi possível exportar.');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(await res.blob());
+      a.download = `dobrapay-movimentos-${f.get('from')}-a-${f.get('to')}.csv`;
+      a.click();
+      toast('Ficheiro descarregado.');
+    },
+  }),
+
+  ussdSim: () => ({
+    title: 'Simulador USSD (*239#)',
+    html: `<p class="hint" style="margin-top:0">Mostra o menu como num telemóvel sem internet. O número tem de ter conta.</p>
+      <label>Número do cliente<input data-phone value="${esc(state.me.phone)}"></label>
+      <div class="ussd-screen" data-screen></div>
+      <form><div class="row"><input name="reply" inputmode="numeric" autocomplete="off" placeholder="Resposta"><button class="btn primary" style="width:auto">Enviar</button></div></form>
+      <button type="button" class="btn small" data-restart style="margin-top:10px">↺ Recomeçar</button>`,
+    setup: (root) => {
+      const form = $('form', root);
+      let path = [], session = String(Date.now());
+      const show = async () => {
+        const r = await api('POST', '/admin/ussd/simulate', { phone: $('[data-phone]', root).value, text: path.join('*'), session });
+        $('[data-screen]', root).textContent = r.response.replace(/^(CON|END) /, '');
+        form.hidden = r.response.startsWith('END');
+      };
+      form._show = show;
+      form._push = (v) => { path.push(v); return show(); };
+      $('[data-restart]', root).addEventListener('click', () => { path = []; session = String(Date.now()); show(); });
+      show().catch((err) => toast(err.message, true));
+    },
+    submit: async (f, key, form) => { const v = f.get('reply'); form.reply.value = ''; await form._push(v); },
+  }),
+
   admin: () => ({
     title: 'Painel de administração',
     html: '<div data-stats></div><input data-search placeholder="Procurar por nome ou número"><div data-users></div>',
@@ -880,7 +1230,13 @@ const SHEETS = {
       <div><span>Número</span><span>${flagOf(state.me.country)} ${esc(prettyPhone(state.me.phone))}</span></div>
       <div><span>Recebe em</span><span>${esc(state.me.receive_currency)}</span></div>
       <div><span>Conta</span><span>${{ user: 'Cliente', agent: 'Agente', admin: 'Administrador' }[state.me.role]} · nível ${state.me.tier}</span></div></div>
-      <form data-myiban data-own><h3 style="font-size:1rem">O meu IBAN (para levantar)</h3>
+      <div class="toggle-row"><span>🔔 ${t('Notificações')}</span><button type="button" class="btn small" data-push>${t('Ativar')}</button></div>
+      <div class="toggle-row"><span>🙂 ${t('Face ID / impressão digital')}</span><button type="button" class="btn small" data-addpasskey>${t('Ativar')}</button></div>
+      <div data-passkeys></div>
+      <div class="toggle-row"><span>🪪 ${t('Identidade')}: <b data-kycstatus>…</b></span><button type="button" class="btn small" data-go="kyc" data-kycbtn hidden>${t('Verificar')}</button></div>
+      <div class="toggle-row"><span>🔁 ${t('Envios automáticos')}</span><button type="button" class="btn small" data-go="scheduled">${t('Ver')}</button></div>
+      <div class="toggle-row"><span>🌐 ${t('Idioma')}</span><select data-lang style="width:auto"></select></div>
+      <form data-myiban data-own style="margin-top:14px"><h3 style="font-size:1rem">O meu IBAN (para levantar)</h3>
       <label>IBAN<input name="iban" autocomplete="off" style="text-transform:uppercase" placeholder="PT50 0000 0000 0000 0000 0000 0"></label>
       <label>Titular<input name="holder" maxlength="80" value="${esc(state.me.name)}"></label>
       <button class="btn" style="width:100%;margin-bottom:16px">Guardar IBAN</button></form>
@@ -900,7 +1256,42 @@ const SHEETS = {
         try { await api('POST', '/me/bank-account', { iban: f.iban.value, holder: f.holder.value }); toast(f.iban.value ? 'IBAN guardado.' : 'IBAN apagado.'); }
         catch (err) { toast(err.message, true); }
       });
-      const mine = await api('GET', '/me/bank-account');
+      fillLangSelect($('[data-lang]', root));
+      // Notificações
+      const pb = $('[data-push]', root);
+      const syncPush = async () => { const on = await pushEnabled().catch(() => false); pb.textContent = t(on ? 'Desativar' : 'Ativar'); pb.dataset.on = on ? '1' : ''; };
+      pb.addEventListener('click', async () => {
+        try {
+          if (pb.dataset.on) { await disablePush(); toast(t('Notificações desativadas.')); }
+          else { await enablePush(); await api('POST', '/push/test'); toast(t('Notificações ativadas ✓')); }
+        } catch (err) { toast(errText(err), true); }
+        syncPush();
+      });
+      syncPush();
+      // Face ID / impressão digital
+      const renderKeys = (keys) => {
+        $('[data-passkeys]', root).innerHTML = keys.map((k) => `<div class="copy-row"><div><small>${t('Ativo neste dispositivo')}</small><strong>${esc(k.label)}</strong></div>
+          <button type="button" class="btn small danger" data-delkey="${esc(k.id)}">${t('Remover')}</button></div>`).join('');
+        root.querySelectorAll('[data-delkey]').forEach((b) => b.addEventListener('click', async () => renderKeys(await api('DELETE', `/passkeys/${encodeURIComponent(b.dataset.delkey)}`))));
+      };
+      const kb = $('[data-addpasskey]', root);
+      if (!window.PublicKeyCredential) kb.disabled = true;
+      kb.addEventListener('click', async () => {
+        try {
+          const wa = await loadWebAuthn();
+          const o = await api('POST', '/passkeys/options');
+          const response = await wa.startRegistration({ optionsJSON: o.options });
+          renderKeys(await api('POST', '/passkeys', { challenge_id: o.challenge_id, response, label: /iPhone|iPad/.test(navigator.userAgent) ? 'iPhone' : /Android/.test(navigator.userAgent) ? 'Android' : 'Este dispositivo' }));
+          toast(t('Pronto! Da próxima vez pode entrar com Face ID / impressão digital.'));
+        } catch (err) { if (!(err && err.name === 'NotAllowedError')) toast(errText(err), true); }
+      });
+      // Identidade
+      const kyc = await api('GET', '/me/kyc');
+      const ks = $('[data-kycstatus]', root);
+      ks.textContent = kyc.tier >= 2 ? t('verificada ✓') : kyc.request && kyc.request.status === 'pending' ? t('em análise') : kyc.request && kyc.request.status === 'rejected' ? t('recusada: {why}', { why: kyc.request.note }) : t('por verificar');
+      $('[data-kycbtn]', root).hidden = kyc.tier >= 2 || (kyc.request && kyc.request.status === 'pending');
+      const [mine, keys] = await Promise.all([api('GET', '/me/bank-account'), api('GET', '/passkeys')]);
+      renderKeys(keys);
       if (mine.account) { f.iban.value = mine.account.iban; f.holder.value = mine.account.holder; }
     },
     submit: async (f) => {
@@ -979,7 +1370,7 @@ function openSheet(name, arg) {
     btn.disabled = true;
     try { await def.submit(new FormData(form), key, form); }
     catch (err) {
-      toast(err.message, true);
+      toast(errText(err), true);
       const pin = form.querySelector('[name=pin]'); if (pin) pin.value = '';
       if (['rate_changed', 'quote_expired', 'quote_used', 'quote_invalid'].includes(err.code)) form.dispatchEvent(new Event('change')); // mostra a nova cotação
     }
@@ -1043,6 +1434,87 @@ $('#sheet').addEventListener('click', (e) => { if (e.target.id === 'sheet') clos
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
 document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.open)));
 
+
+// ---------------- Comprovativo (imagem desenhada no telemóvel) ----------------
+function drawReceipt(tx) {
+  const W = 720, rows = [];
+  const out = tx.direction === 'out' || tx.direction === 'self';
+  rows.push([t('Data'), new Date(tx.created_at).toLocaleString(LANG)]);
+  rows.push([t('Tipo'), t(TX_LABEL[tx.type] || tx.type)]);
+  rows.push([t('De'), `${tx.from.name}${tx.from.phone ? ' · ' + prettyPhone(tx.from.phone) : ''}`]);
+  rows.push([t('Para'), tx.bank ? `${tx.bank.holder} · ${tx.bank.iban.replace(/(.{4})/g, '$1 ').trim()}` : tx.bill ? `${tx.bill.account_ref}` : `${tx.to.name}${tx.to.phone ? ' · ' + prettyPhone(tx.to.phone) : ''}`]);
+  rows.push([t('Valor enviado'), money(tx.amount, tx.currency)]);
+  if (tx.fee) rows.push([t('Taxa'), money(tx.fee, tx.currency)]);
+  if (tx.currency !== tx.to_currency) rows.push([t('Câmbio'), `1 ${tx.currency} = ${Number(tx.rate).toLocaleString(LANG, { maximumSignificantDigits: 6 })} ${tx.to_currency}`]);
+  rows.push([t('Valor recebido'), money(tx.to_amount, tx.to_currency)]);
+  if (tx.note) rows.push([t('Mensagem'), tx.note]);
+  if (tx.bank) rows.push([t('Referência'), tx.bank.reference]);
+  if (tx.bill && tx.bill.token) rows.push([t('Código'), tx.bill.token]);
+  rows.push([t('N.º da operação'), tx.id]);
+  const H = 300 + rows.length * 62 + 90;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, W, H);
+  g.fillStyle = '#0f7a3d'; g.fillRect(0, 0, W, 200);
+  g.fillStyle = '#d21034'; g.fillRect(0, 0, 18, 200);
+  g.fillStyle = '#f6c90e'; g.fillRect(18, 186, W, 14);
+  g.fillStyle = '#ffffff'; g.font = 'bold 40px system-ui, sans-serif'; g.fillText('DobraPay', 48, 78);
+  g.font = '26px system-ui, sans-serif'; g.fillText(t('Comprovativo'), 48, 120);
+  g.font = 'bold 46px system-ui, sans-serif';
+  g.fillText(`${out ? '-' : '+'}${money(out ? tx.amount + tx.fee : tx.to_amount, out ? tx.currency : tx.to_currency)}`, 48, 172);
+  let y = 270;
+  for (const [k, v] of rows) {
+    g.fillStyle = '#66736b'; g.font = '22px system-ui, sans-serif'; g.fillText(k, 48, y);
+    g.fillStyle = '#17211b'; g.font = 'bold 24px system-ui, sans-serif';
+    let text = String(v);
+    while (g.measureText(text).width > W - 96 && text.length > 4) text = text.slice(0, -2);
+    if (text !== String(v)) text = text.slice(0, -1) + '…';
+    g.fillText(text, 48, y + 30);
+    g.fillStyle = '#e3e8e4'; g.fillRect(48, y + 44, W - 96, 2);
+    y += 62;
+  }
+  g.fillStyle = '#66736b'; g.font = '20px system-ui, sans-serif';
+  g.fillText(t('Operação registada pela DobraPay. Guarde este comprovativo.'), 48, H - 40);
+  return c;
+}
+
+// Reduz uma foto (ex.: 4000 px da câmara) para enviar rápido mesmo com rede fraca.
+async function shrinkImage(file, maxSide, quality) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => { const i = new Image(); i.onload = () => resolve(i); i.onerror = reject; i.src = url; });
+    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL('image/jpeg', quality);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+// ---------------- Notificações push ----------------
+const b64ToBytes = (b64) => { const s = atob((b64 + '='.repeat((4 - b64.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(s, (ch) => ch.charCodeAt(0)); };
+async function enablePush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    throw new Error(t('Este telemóvel não suporta notificações. No iPhone, instale primeiro a app no ecrã principal (Partilhar → Adicionar ao ecrã principal).'));
+  }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') throw new Error(t('As notificações foram recusadas. Pode ativá-las nas definições do telemóvel.'));
+  const reg = await navigator.serviceWorker.ready;
+  const { publicKey } = await api('GET', '/push/key');
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(publicKey) });
+  await api('POST', '/push/subscribe', sub.toJSON());
+}
+async function disablePush() {
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (sub) { await api('POST', '/push/unsubscribe', { endpoint: sub.endpoint }); await sub.unsubscribe(); }
+}
+async function pushEnabled() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || Notification.permission !== 'granted') return false;
+  const reg = await navigator.serviceWorker.ready;
+  return !!(await reg.pushManager.getSubscription());
+}
+
 // ---------------- Arranque ----------------
 // Nenhum formulário é enviado "à moda antiga" (isso recarregava a página e
 // punha o PIN no endereço). Os formulários são sempre tratados em JavaScript.
@@ -1055,6 +1527,8 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catc
 (async () => {
   try { CFG = await api('GET', '/config'); } catch (err) { toast(err.message, true); return; }
   setupAuthCountry();
+  fillLangSelect($('#langSelect'));
+  setAuthMode('login');
   const link = parseLink(location.href);
   if (link) {
     sessionStorage.setItem('dp_link', JSON.stringify(link));

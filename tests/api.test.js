@@ -8,7 +8,9 @@ const { signWebhook } = require('../src/payouts');
 const http = require('http');
 
 const ADMIN = '9900000';
-let server, base, db;
+let server, base, db, service;
+const pushes = []; // notificações enviadas (falsas)
+const USSD_KEY = 'ussd-de-teste';
 // Parceiro de pagamentos falso (para testar o modo 'http'): regista as ordens recebidas.
 const partner = { orders: [], fail: false, server: null, url: '' };
 const WEBHOOK_SECRET = 'segredo-de-teste';
@@ -38,8 +40,14 @@ test.before(async () => {
   await new Promise((r) => partner.server.once('listening', r));
   partner.url = `http://127.0.0.1:${partner.server.address().port}/payouts`;
   db = await openDb(PG_URL ? { url: PG_URL } : { file: ':memory:' });
-  const service = createService(db, { adminPhone: ADMIN, sandboxDelayMs: 100, env: { PAYOUT_HTTP_URL: partner.url, PAYOUT_HTTP_TOKEN: 'token-parceiro' } });
-  server = createApp(service, { webhookSecret: WEBHOOK_SECRET }).listen(0);
+  service = createService(db, {
+    adminPhone: ADMIN, sandboxDelayMs: 100, env: { PAYOUT_HTTP_URL: partner.url, PAYOUT_HTTP_TOKEN: 'token-parceiro' },
+    pushSender: async (sub, payload, userId) => {
+      if (sub.endpoint.includes('expirado')) throw Object.assign(new Error('gone'), { statusCode: 410 });
+      pushes.push({ userId, endpoint: sub.endpoint, ...JSON.parse(payload) });
+    },
+  });
+  server = createApp(service, { webhookSecret: WEBHOOK_SECRET, ussdSecret: USSD_KEY }).listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}/api`;
 });
@@ -53,8 +61,11 @@ async function call(method, path, body, token) {
   });
   return { status: res.status, body: await res.json() };
 }
+// Registo como na app: pede o código por SMS (em modo de teste vem na resposta) e cria a conta.
 const register = async (phone, name, country = 'ST', pin = '2580') => {
-  const r = await call('POST', '/auth/register', { phone, name, pin, country });
+  const otp = await call('POST', '/auth/otp', { phone, country, purpose: 'register' });
+  assert.equal(otp.status, 200, JSON.stringify(otp.body));
+  const r = await call('POST', '/auth/register', { phone, name, pin, country, code: otp.body.dev_code });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   return r.body;
 };
@@ -578,6 +589,237 @@ test('parceiro por API: recebe a ordem, confirma por webhook assinado; se falhar
   const paid = await call('POST', `/admin/bank/requests/${w2.body.request.id}/paid`, { bank_reference: 'MANUAL-1', pin: '2580' }, admin.token);
   assert.equal(paid.body.status, 'completed');
   await call('POST', '/admin/payout-providers', { currency: 'EUR', provider: 'manual', pin: '2580' }, admin.token);
+});
+
+// ======================= Funcionalidades v6 =======================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const IMG = 'data:image/jpeg;base64,' + Buffer.from('foto de teste').toString('base64');
+
+test('SMS: registo exige o código certo; "esqueci o PIN" com código termina as outras sessões', async () => {
+  assert.equal((await call('POST', '/auth/register', { phone: '9960001', name: 'Rui Sem Código', pin: '2580', country: 'ST' })).body.error, 'otp_expired');
+  const o = await call('POST', '/auth/otp', { phone: '9960001', country: 'ST', purpose: 'register' });
+  assert.match(o.body.dev_code, /^\d{6}$/);
+  const wrong = o.body.dev_code === '000000' ? '111111' : '000000';
+  assert.equal((await call('POST', '/auth/register', { phone: '9960001', name: 'Rui Lopes', pin: '2580', country: 'ST', code: wrong })).body.error, 'otp_wrong');
+  const ok = await call('POST', '/auth/register', { phone: '9960001', name: 'Rui Lopes', pin: '2580', country: 'ST', code: o.body.dev_code });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal((await call('POST', '/auth/otp', { phone: '9960001', country: 'ST', purpose: 'register' })).body.error, 'phone_taken');
+  // Esqueci o PIN: para um número sem conta a resposta é igual mas sem código (não revela clientes).
+  const ghost = await call('POST', '/auth/otp', { phone: '9960009', country: 'ST', purpose: 'reset_pin' });
+  assert.equal(ghost.body.sent, true);
+  assert.equal(ghost.body.dev_code, undefined);
+  const r = await call('POST', '/auth/otp', { phone: '9960001', country: 'ST', purpose: 'reset_pin' });
+  const reset = await call('POST', '/auth/reset-pin', { phone: '9960001', country: 'ST', code: r.body.dev_code, newPin: '7391' });
+  assert.equal(reset.status, 200, JSON.stringify(reset.body));
+  assert.equal((await call('GET', '/me', null, ok.body.token)).status, 401); // a sessão antiga terminou
+  assert.equal((await call('POST', '/auth/login', { phone: '9960001', pin: '7391', country: 'ST' })).status, 200);
+  assert.equal((await call('POST', '/auth/reset-pin', { phone: '9960001', country: 'ST', code: r.body.dev_code, newPin: '4826' })).body.error, 'otp_expired'); // código já usado
+});
+
+let kycUser;
+test('identidade: documento + selfie, admin aprova e os limites sobem para o nível 2', async () => {
+  kycUser = await register('699111222', 'Lúcia Fernandes', 'ES');
+  const base = { full_name: 'Lúcia Fernandes Costa', doc_type: 'passaporte', doc_number: 'X1234567', birth_date: '1990-05-17', doc_image: IMG, selfie_image: IMG };
+  assert.equal((await call('POST', '/me/kyc', { ...base, doc_image: 'não é imagem' }, kycUser.token)).body.error, 'bad_image');
+  assert.equal((await call('POST', '/me/kyc', { ...base, birth_date: '2015-01-01' }, kycUser.token)).body.error, 'bad_birth');
+  const k = await call('POST', '/me/kyc', base, kycUser.token);
+  assert.equal(k.status, 200, JSON.stringify(k.body));
+  assert.equal(k.body.status, 'pending');
+  assert.equal((await call('POST', '/me/kyc', base, kycUser.token)).body.error, 'kyc_pending');
+  const queue = (await call('GET', '/admin/kyc', null, admin.token)).body;
+  const item = queue.find((x) => x.user.name === 'Lúcia Fernandes');
+  assert.equal(item.doc_image, IMG);
+  assert.equal((await call('GET', '/admin/kyc', null, kycUser.token)).status, 403);
+  await call('POST', '/push/subscribe', { endpoint: 'https://push.exemplo/lucia', keys: { p256dh: 'p', auth: 'a' } }, kycUser.token);
+  const ap = await call('POST', `/admin/kyc/${item.id}`, { approve: true, pin: '2580' }, admin.token);
+  assert.equal(ap.body.status, 'approved');
+  const me2 = await me(kycUser.token);
+  assert.equal(me2.tier, 2);
+  assert.equal(me2.limits.perTx, 200_000); // 2 000 €
+  assert.ok(pushes.some((p) => p.userId === kycUser.user.id && /Identidade verificada/.test(p.title)));
+  assert.equal((await call('GET', '/me/kyc', null, kycUser.token)).body.request.status, 'approved');
+});
+
+test('alertas antifraude: operação grande de conta nova abre alertas; admin analisa e bloqueia', async () => {
+  await call('POST', '/agent/cash-in', { to: '+34699111222', amount: '1500', pin: '2580' }, agentES.token);
+  const r = await call('POST', '/transfers', { to: '612345678', amount: '1000', pin: '2580', from_currency: 'EUR' }, kycUser.token);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  await sleep(150);
+  const alerts = (await call('GET', '/admin/alerts', null, admin.token)).body.filter((a) => a.user.id === kycUser.user.id);
+  assert.deepEqual(alerts.map((a) => a.rule).sort(), ['large_tx', 'new_account']);
+  assert.equal((await call('GET', '/admin/alerts', null, ana.token)).status, 403);
+  assert.equal((await call('POST', `/admin/alerts/${alerts[0].id}/close`, { pin: '2580' }, admin.token)).body.error, 'bad_reason');
+  await call('POST', `/admin/alerts/${alerts[0].id}/close`, { note: 'Origem dos fundos por confirmar', block_user: true, pin: '2580' }, admin.token);
+  assert.equal((await call('GET', '/me', null, kycUser.token)).status, 401); // bloqueada
+  const closed = (await call('GET', '/admin/alerts?status=closed', null, admin.token)).body;
+  assert.ok(closed.some((a) => a.note === 'Origem dos fundos por confirmar'));
+});
+
+test('notificações: quem recebe é avisado; pedidos avisam quem paga; subscrições expiradas são apagadas', async () => {
+  assert.ok((await call('GET', '/push/key')).body.publicKey.length > 40);
+  assert.equal((await call('POST', '/push/subscribe', { endpoint: 'http://inseguro', keys: { p256dh: 'x', auth: 'y' } }, bruno.token)).status, 400);
+  await call('POST', '/push/subscribe', { endpoint: 'https://push.exemplo/bruno', keys: { p256dh: 'p', auth: 'a' } }, bruno.token);
+  await call('POST', '/push/subscribe', { endpoint: 'https://push.exemplo/expirado', keys: { p256dh: 'p', auth: 'a' } }, bruno.token);
+  pushes.length = 0;
+  await call('POST', '/transfers', { to: '9923456', amount: '15', note: 'Pão', pin: '2580' }, ana.token);
+  await sleep(100);
+  const got = pushes.find((p) => p.userId === bruno.user.id);
+  assert.match(got.title, /Recebeu dinheiro/);
+  assert.match(got.body, /15,00 STN de Ana Costa · Pão/);
+  assert.equal(await db.get("SELECT 1 AS x FROM push_subscriptions WHERE endpoint LIKE '%expirado'"), null);
+  pushes.length = 0;
+  await call('POST', '/requests', { from: '9923456', amount: '5', note: 'Táxi' }, ana.token);
+  await sleep(50);
+  assert.ok(pushes.some((p) => p.userId === bruno.user.id && /Pedido de dinheiro/.test(p.title)));
+  await call('POST', '/push/unsubscribe', { endpoint: 'https://push.exemplo/bruno' }, bruno.token);
+});
+
+test('Face ID / impressão digital: pedidos de registo e entrada; credencial desconhecida é recusada', async () => {
+  const o = await call('POST', '/passkeys/options', null, ana.token);
+  assert.equal(o.status, 200, JSON.stringify(o.body));
+  assert.ok(o.body.challenge_id && o.body.options.challenge);
+  assert.equal(o.body.options.rp.id, '127.0.0.1');
+  assert.equal((await call('POST', '/passkeys/options')).status, 401);
+  const l = await call('POST', '/auth/passkey/options');
+  assert.ok(l.body.options.challenge);
+  const bad = await call('POST', '/auth/passkey', { challenge_id: l.body.challenge_id, response: { id: 'nao-existe', rawId: 'nao-existe', response: {}, type: 'public-key' } });
+  assert.equal(bad.body.error, 'passkey_unknown');
+  assert.equal((await call('POST', '/auth/passkey', { challenge_id: l.body.challenge_id, response: { id: 'x' } })).body.error, 'passkey_expired'); // desafio de uso único
+  assert.deepEqual((await call('GET', '/passkeys', null, ana.token)).body, []);
+  const lib = await fetch(base.replace('/api', '') + '/vendor/webauthn.js');
+  assert.equal(lib.status, 200);
+  assert.match(await lib.text(), /SimpleWebAuthnBrowser/);
+});
+
+test('comprovativos: detalhes do movimento só para quem participou', async () => {
+  const tx = (await call('GET', '/transactions', null, ana.token)).body[0];
+  const d = await call('GET', `/transactions/${tx.id}`, null, ana.token);
+  assert.equal(d.status, 200);
+  assert.equal(d.body.id, tx.id);
+  assert.equal((await call('GET', `/transactions/${tx.id}`, null, maria.token)).status, 404);
+});
+
+test('envios automáticos: executa no dia, só uma vez por mês, tenta de novo se faltar saldo', async () => {
+  assert.equal((await call('POST', '/scheduled', { to: '9923456', amount: '20', day_of_month: 31, pin: '2580' }, ana.token)).body.error, 'bad_day');
+  const c = await call('POST', '/scheduled', { to: '9923456', amount: '20', note: 'Mesada', day_of_month: 5, pin: '2580' }, ana.token);
+  assert.equal(c.status, 200, JSON.stringify(c.body));
+  assert.ok(c.body.next_run_at > Date.now());
+  assert.equal(c.body.to_name, 'Bruno Neto');
+  const due = Date.UTC(2026, 10, 5, 9);
+  await db.run('UPDATE scheduled_transfers SET next_run_at = ? WHERE id = ?', due, c.body.id);
+  const before = await bal(bruno.token, 'STN');
+  const r1 = await service.runDueScheduled();
+  assert.ok(r1.find((x) => x.id === c.body.id).ok);
+  assert.equal(await bal(bruno.token, 'STN'), before + 2_000);
+  const after = (await call('GET', '/scheduled', null, ana.token)).body.find((x) => x.id === c.body.id);
+  assert.equal(after.last_status, 'ok');
+  assert.equal(new Date(after.next_run_at).toISOString(), '2026-12-05T09:00:00.000Z');
+  // Mesmo mês outra vez (ex.: dois servidores): não paga a dobrar.
+  await db.run('UPDATE scheduled_transfers SET next_run_at = ? WHERE id = ?', due, c.body.id);
+  await service.runDueScheduled();
+  assert.equal(await bal(bruno.token, 'STN'), before + 2_000);
+  // Sem saldo: falha, avisa e tenta amanhã.
+  const big = await call('POST', '/scheduled', { to: '9912345', amount: '9000', day_of_month: 1, pin: '2580' }, bruno.token);
+  await db.run('UPDATE scheduled_transfers SET next_run_at = ? WHERE id = ?', Date.now() - 1000, big.body.id);
+  pushes.length = 0;
+  await call('POST', '/push/subscribe', { endpoint: 'https://push.exemplo/bruno2', keys: { p256dh: 'p', auth: 'a' } }, bruno.token);
+  const r2 = await service.runDueScheduled();
+  assert.equal(r2.find((x) => x.id === big.body.id).ok, false);
+  const s2 = (await call('GET', '/scheduled', null, bruno.token)).body.find((x) => x.id === big.body.id);
+  assert.equal(s2.failures, 1);
+  assert.ok(s2.next_run_at > Date.now() + 23 * 3600_000);
+  await sleep(50);
+  assert.ok(pushes.some((p) => /Envio automático falhou/.test(p.title)));
+  await call('DELETE', `/scheduled/${big.body.id}`, null, bruno.token);
+  await call('DELETE', `/scheduled/${c.body.id}`, null, ana.token);
+  assert.equal((await call('GET', '/scheduled', null, ana.token)).body.length, 0);
+});
+
+test('recargas e contas: recarga CST, energia pré-paga com código; recusa devolve o dinheiro', async () => {
+  const billers = (await call('GET', '/bills/billers', null, ana.token)).body;
+  assert.ok(billers.some((b) => b.id === 'emae_energia' && b.simulated));
+  const before = await bal(ana.token, 'STN');
+  const r = await call('POST', '/bills', { biller: 'cst_recarga', account_ref: '991 2345', amount: '50', pin: '2580' }, ana.token);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.payment.status, 'completed');
+  assert.equal(await bal(ana.token, 'STN'), before - 5_000);
+  const e = await call('POST', '/bills', { biller: 'emae_energia', account_ref: '12345678901', amount: '100', pin: '2580' }, ana.token);
+  assert.match(e.body.payment.token, /^\d{4}(-\d{4}){4}$/);
+  assert.equal((await call('POST', '/bills', { biller: 'emae_energia', account_ref: '12', amount: '100', pin: '2580' }, ana.token)).body.error, 'bad_ref');
+  assert.equal((await call('POST', '/bills', { biller: 'cst_recarga', account_ref: '9912345', amount: '1', pin: '2580' }, ana.token)).body.error, 'bad_amount');
+  const mid = await bal(ana.token, 'STN');
+  const f = await call('POST', '/bills', { biller: 'emae_agua', account_ref: 'FAT-0000', amount: '30', pin: '2580' }, ana.token);
+  assert.equal(f.body.payment.status, 'failed');
+  assert.equal(await bal(ana.token, 'STN'), mid); // devolvido
+  // Pagar contas de São Tomé a partir de euros (Maria em Espanha).
+  const q = (await call('GET', '/quote/bill?biller=cst_recarga&amount=100&from_currency=EUR', null, maria.token)).body;
+  assert.equal(q.to_amount, 10_000);
+  const m = await call('POST', '/bills', { biller: 'cst_recarga', account_ref: '+2399923456', amount: '100', from_currency: 'EUR', pin: '2580' }, maria.token);
+  assert.equal(m.body.payment.from_currency, 'EUR');
+  assert.equal((await call('GET', '/bills', null, ana.token)).body.length, 3);
+});
+
+test('agentes: perfil com localização, agentes perto de mim e comissões automáticas', async () => {
+  assert.equal((await call('POST', '/agent/profile', { business: 'Loja X', address: 'Rua 1', lat: 0, lng: 0 }, ana.token)).status, 403);
+  const p = await call('POST', '/agent/profile', { business: 'Mercearia Trindade', address: 'Av. Marginal 12, São Tomé', hours: '8h–20h', lat: 0.3365, lng: 6.7273 }, agentST.token);
+  assert.equal(p.status, 200, JSON.stringify(p.body));
+  await call('POST', '/agent/profile', { business: 'Locutorio Madrid', address: 'Calle Mayor 1, Madrid', lat: 40.4168, lng: -3.7038 }, agentES.token);
+  const near = (await call('GET', '/agents/nearby?lat=0.30&lng=6.70', null, ana.token)).body;
+  assert.equal(near[0].name, 'Mercearia Trindade');
+  assert.ok(near[0].distance_km < 10);
+  assert.match(near[0].maps_url, /google\.com\/maps/);
+  assert.equal(near[0].currency, 'STN');
+  const byCountry = (await call('GET', '/agents/nearby', null, maria.token)).body;
+  assert.deepEqual(byCountry.map((a) => a.name), ['Locutorio Madrid']);
+  // Comissão no depósito: 0,3% de 2 000 STN = 6 STN.
+  const before = await bal(agentST.token, 'STN');
+  await call('POST', '/agent/cash-in', { to: '9912345', amount: '2000', pin: '2580' }, agentST.token);
+  assert.equal(await bal(agentST.token, 'STN'), before - 200_000 + 600);
+  const st = (await call('GET', '/agent/stats', null, agentST.token)).body;
+  assert.ok(st.commissions.find((c) => c.currency === 'STN').total >= 600);
+  assert.ok(st.cash_in >= 1);
+  const hist = (await call('GET', '/transactions', null, agentST.token)).body;
+  assert.equal(hist[0].type, 'commission');
+});
+
+test('USSD: menu, saldo, enviar com PIN e levantar código, sem internet', async () => {
+  const u = async (text, phone = '+2399912345', session = 's1', key = USSD_KEY) => {
+    const res = await fetch(`${base}/ussd?key=${key}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ sessionId: session, serviceCode: '*239#', phoneNumber: phone, text }) });
+    return { status: res.status, text: await res.text() };
+  };
+  assert.equal((await u('', '+2399912345', 's0', 'errada')).status, 401);
+  assert.match((await u('')).text, /^CON DobraPay\n1\. Ver saldo/);
+  assert.match((await u('1')).text, /^CON Introduza o seu PIN/);
+  assert.match((await u('1*2580')).text, /^END Saldo:\n[\d ]+,\d{2} STN/);
+  assert.match((await u('1*0000')).text, /^END PIN errado/);
+  await call('POST', '/auth/login', { phone: '9912345', pin: '2580' }); // repõe as tentativas
+  assert.match((await u('2')).text, /^CON Número de quem recebe/);
+  assert.match((await u('2*9923456')).text, /^CON Para Bruno Neto/);
+  assert.match((await u('2*9923456*10')).text, /^CON Enviar 10,00 STN a Bruno Neto\?/);
+  const before = await bal(bruno.token, 'STN');
+  assert.match((await u('2*9923456*10*2580', '+2399912345', 'ussd-envio')).text, /^END Enviado! Bruno Neto recebeu 10,00 STN/);
+  assert.match((await u('2*9923456*10*2580', '+2399912345', 'ussd-envio')).text, /^END Enviado!/); // repetição: não paga duas vezes
+  assert.equal(await bal(bruno.token, 'STN'), before + 1_000);
+  assert.match((await u('3*100*2580')).text, /^END Código de levantamento: \d{6}/);
+  assert.match((await u('4*2580')).text, /^END [+-]/);
+  assert.match((await u('', '+2399000111')).text, /^END DobraPay: este número ainda não tem conta/);
+  const sim = await call('POST', '/admin/ussd/simulate', { phone: '+2399912345', text: '' }, admin.token);
+  assert.match(sim.body.response, /^CON DobraPay/);
+  assert.equal((await call('POST', '/admin/ussd/simulate', { phone: '+2399912345', text: '' }, ana.token)).status, 403);
+});
+
+test('relatórios: exportação CSV dos movimentos só para o admin', async () => {
+  const res = await fetch(base + '/admin/export.csv', { headers: { authorization: 'Bearer ' + admin.token } });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /text\/csv/);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]); // marca para o Excel ler os acentos
+  const csv = bytes.subarray(3).toString('utf8');
+  assert.ok(csv.startsWith('data;id;tipo;de;'));
+  assert.ok(csv.split('\r\n').length > 20);
+  assert.match(csv, /;commission;/);
+  assert.equal((await fetch(base + '/admin/export.csv', { headers: { authorization: 'Bearer ' + ana.token } })).status, 403);
 });
 
 test('livro-razão: em cada moeda a soma de todos os saldos é zero', async () => {
