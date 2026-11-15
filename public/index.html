@@ -61,11 +61,18 @@
     <nav class="actions">
       <button type="button" data-open="send"><span>↗</span>Enviar</button>
       <button type="button" data-open="receive"><span>↙</span>Receber</button>
+      <button type="button" data-open="pay"><span>🛒</span>Pagar</button>
       <button type="button" data-open="request"><span>✋</span>Pedir</button>
-      <button type="button" data-open="cashout"><span>💵</span>Levantar</button>
+      <button type="button" data-open="topup"><span>＋</span>Carregar</button>
+      <button type="button" data-open="withdraw"><span>💵</span>Levantar</button>
       <button type="button" data-open="exchange"><span>⇄</span>Câmbio</button>
     </nav>
 
+    <section id="merchantBar" class="role-bar" hidden>
+      <strong id="merchantName">Loja</strong>
+      <button type="button" class="btn small primary" data-open="charge" style="width:auto">Cobrar</button>
+      <button type="button" class="btn small" data-open="charges">Cobranças</button>
+    </section>
     <section id="agentBar" class="role-bar" hidden>
       <strong>Agente</strong>
       <button type="button" class="btn small" data-open="cashin">Depósito de cliente</button>
@@ -76,6 +83,8 @@
       <button type="button" class="btn small" data-open="admin">Painel</button>
       <button type="button" class="btn small" data-open="float">Emitir float</button>
       <button type="button" class="btn small" data-open="rates">Câmbios</button>
+      <button type="button" class="btn small" data-open="bankAdmin">Banco <span id="bankBadge"></span></button>
+      <button type="button" class="btn small" data-open="settlement">Acertos</button>
     </section>
 
     <section id="pending"></section>

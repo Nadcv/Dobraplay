@@ -24,9 +24,10 @@ Antes de cada confirmação, a app mostra **quanto paga, a taxa, o câmbio e qua
 
 | Para quem | Funcionalidades |
 |---|---|
-| **Cliente** | Conta com número de qualquer dos 5 países e PIN · várias carteiras (STN, AOA, CVE, EUR, USD) · **enviar** para qualquer país (nome do destinatário visível antes de confirmar) · **receber** com QR code e escolher a moeda · **pedir** dinheiro · **câmbio** entre carteiras · **levantar** num agente com código de 6 dígitos · histórico · mudar PIN |
+| **Cliente** | Conta com número de qualquer dos 5 países e PIN · várias carteiras (STN, AOA, CVE, EUR, USD) · **enviar** para qualquer país (nome do destinatário visível antes de confirmar) · **receber** com QR code e escolher a moeda · **pedir** dinheiro · **câmbio** entre carteiras · **pagar em lojas** com QR ou código · **carregar e levantar por transferência bancária** (IBAN) · **levantar** num agente com código de 6 dígitos · histórico · mudar PIN |
+| **Loja** | Conta de loja (ativada pelo admin) · **cobrar com QR code** ou código de 6 letras · o cliente paga com qualquer moeda e a loja recebe o valor exato · histórico de cobranças |
 | **Agente** | **Depósito** para qualquer pessoa em qualquer país (o cliente paga em dinheiro vivo na moeda do agente) · **levantamento** com código |
-| **Administrador** | Estatísticas por moeda · gerir utilizadores (agente, admin, bloquear) · **emitir float** na moeda do agente · **atualizar câmbios** (AOA e USD; STN e CVE têm paridade fixa com o euro) · verificação automática do livro-razão |
+| **Administrador** | Estatísticas por moeda · gerir utilizadores (agente, admin, bloquear) · **emitir float** na moeda do agente · **atualizar câmbios** (AOA e USD; STN e CVE têm paridade fixa com o euro) · **contas bancárias da empresa** · **confirmar carregamentos e pagar levantamentos bancários** · **acerto entre bancos** (ex.: CGD ⇄ BISTP) · ativar contas de loja · verificação automática do livro-razão |
 
 ### Taxas e câmbio (ajustáveis em `src/config.js`)
 
@@ -36,6 +37,9 @@ Antes de cada confirmação, a app mostra **quanto paga, a taxa, o câmbio e qua
 | Enviar para outro país ou noutra moeda | 1% (mín. 0,50 €, máx. 20 €) + margem de câmbio de 1% |
 | Câmbio entre as próprias carteiras | só a margem de 1% |
 | Levantar num agente | 1% (mín. 0,20 €, máx. 8 €) |
+| Carregar por transferência bancária | **Grátis** |
+| Levantar para o banco (IBAN) | 1% (mín. 0,50 €, máx. 5 €) |
+| Pagar numa loja | **Grátis** para o cliente (só a margem de câmbio, se pagar noutra moeda) |
 
 Câmbios iniciais por 1 €: STN 24,5 (fixo) · CVE 110,265 (fixo) · **AOA 1060 · USD 1,16. Atualize estes dois no painel antes de usar**, porque flutuam todos os dias.
 
@@ -48,6 +52,22 @@ Limites (nível 1, equivalente em euros): 400 € por operação, 1 000 € por 
 - Valores guardados em **cêntimos inteiros**, operações **atómicas**, pedidos repetidos por rede fraca **nunca pagam duas vezes**.
 - PIN com `scrypt`, **bloqueio de 15 min** após 5 PINs errados, PIN pedido em cada operação.
 
+## Transferências bancárias e acerto entre bancos
+
+A empresa tem **uma conta bancária por moeda** (ex.: EUR na **Caixa Geral de Depósitos** em Portugal, STN no **BISTP** em São Tomé). O admin regista-as em **Acertos → Conta bancária da empresa**.
+
+- **Carregar:** o cliente escolhe o valor e recebe o IBAN da empresa e uma **referência única** (ex.: `DPK7Q2P9`), que escreve no descritivo da transferência. Quando o dinheiro aparece no extrato, o admin confirma em **Banco** o valor recebido, e o saldo entra na carteira.
+- **Levantar:** o cliente indica o seu IBAN (validado). O dinheiro **sai logo da carteira** e fica "por pagar". O admin faz a transferência no banco e marca-a como paga. Se recusar, ou se o cliente cancelar, o valor e a taxa voltam à carteira.
+- **Acerto entre bancos:** os envios entre países compensam-se dentro da app, por isso o dinheiro não atravessa a fronteira em cada envio. O ecrã **Acertos** mostra, em cada moeda, se o banco tem o dinheiro dos clientes e **sugere a transferência** a fazer entre os bancos da empresa (ex.: BISTP → CGD). Depois de a fazer, o admin regista-a e as contas ficam certas.
+
+## Pagamentos em lojas
+
+O admin ativa a conta de loja de um cliente (**Painel → 🏪**). A loja carrega em **Cobrar**, escreve o valor e mostra o **QR code** ou o **código de 6 letras**. O cliente:
+- aponta a **câmara do telemóvel** ao QR (no iPhone também funciona: o QR é um endereço que abre a DobraPay já no pagamento), **ou**
+- carrega em **Pagar** e escreve o código.
+
+O cliente paga com qualquer carteira (Dobras, Euros…), e a loja recebe sempre o valor exato na moeda dela. O ecrã da loja mostra **"Pago ✓"** sozinho, em segundos.
+
 ## Correr no computador
 
 Precisa do Node.js 22.13 ou superior.
@@ -57,7 +77,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 15 testes automáticos (SQLite)
+npm test                            # 22 testes automáticos (SQLite)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
@@ -70,6 +90,7 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | `DB_FILE` | Sem `DATABASE_URL`, usa este ficheiro SQLite (por omissão `data/dobrapay.db`), só para o computador |
 | `ADMIN_PHONE` | Número da conta administradora |
 | `APP_NAME` | Nome da marca (por omissão DobraPay) |
+| `PUBLIC_URL` | Endereço público usado nos QR codes (opcional: por omissão usa o endereço por onde a app foi aberta) |
 
 ## Publicar grátis (Render + Neon)
 

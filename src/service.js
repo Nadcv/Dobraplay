@@ -8,12 +8,13 @@ const C = require('./config');
 const { isUniqueViolation } = require('./db');
 const {
   ApiError, normalizePhone, countryOfPhone, isCurrency, hashPin, verifyPin, isValidPin, sha256, cleanText, formatAmount,
+  normalizeIban, formatIban, randomCode,
 } = require('./util');
 
 const now = () => Date.now();
 // O limite diário usa o dia UTC (São Tomé, Portugal no inverno, Cabo Verde ±1h).
 const startOfDay = (t = now()) => t - (t % 86_400_000);
-const OUTGOING = ['p2p', 'request', 'cash_out'];
+const OUTGOING = ['p2p', 'request', 'cash_out', 'bank_out', 'merchant'];
 const fmt = formatAmount;
 
 // Número crescente para ordenar o histórico quando duas operações têm o mesmo milissegundo.
@@ -65,7 +66,7 @@ function createService(db, { adminPhone } = {}) {
   // Total enviado hoje (em cêntimos de euro), somando todas as carteiras.
   async function sentTodayEur(userId, r) {
     const rows = await db.all(`SELECT t.amount, t.fee, t.currency FROM transactions t JOIN accounts a ON a.id = t.from_account
-                               WHERE a.user_id = ? AND t.type IN ('p2p','request','cash_out') AND t.created_at >= ?`, userId, startOfDay());
+                               WHERE a.user_id = ? AND t.type IN (${OUTGOING.map(() => '?').join(',')}) AND t.created_at >= ?`, userId, ...OUTGOING, startOfDay());
     return rows.reduce((s, t) => s + toEur(t.amount + t.fee, t.currency, r), 0);
   }
   const totalBalanceEur = async (userId, r) => (await walletsOf(userId)).reduce((s, w) => s + toEur(w.balance, w.currency, r), 0);
@@ -75,7 +76,7 @@ function createService(db, { adminPhone } = {}) {
     const r = await rates();
     const wallets = (await walletsOf(u.id)).map((w) => ({ currency: w.currency, balance: w.balance }));
     return {
-      id: u.id, phone: u.phone, name: u.name, role: u.role, tier: u.tier,
+      id: u.id, phone: u.phone, name: u.name, role: u.role, tier: u.tier, merchant_name: u.merchant_name || null,
       country: u.country, home_currency: homeCurrency(u), receive_currency: u.receive_currency,
       wallets,
       total_eur: wallets.reduce((s, w) => s + toEur(w.balance, w.currency, r), 0),
@@ -282,13 +283,34 @@ function createService(db, { adminPhone } = {}) {
       credits.push([(await internal('fx', currency)).id, amount], [(await internal('fx', toCurrency)).id, -toAmount], [toAcc.id, toAmount]);
     }
     if (fee) credits.push([(await internal('fees', currency)).id, fee]);
-    // Atualiza as contas sempre pela mesma ordem (por id) para evitar impasses
-    // entre dois pedidos que tocam as mesmas contas em sentidos opostos.
+    await applyCredits(id, credits);
+    return id;
+  }
+
+  // Grava os lançamentos de uma transação. Atualiza as contas sempre pela mesma
+  // ordem (por id) para evitar impasses entre dois pedidos que tocam as mesmas
+  // contas em sentidos opostos. A soma por moeda tem de ser zero.
+  async function applyCredits(txId, credits) {
+    const byCurrency = {};
+    for (const [accountId, value] of credits) {
+      const { currency } = await accountById(accountId);
+      byCurrency[currency] = (byCurrency[currency] || 0) + value;
+    }
+    if (Object.values(byCurrency).some((v) => v !== 0)) throw new Error('lançamentos desequilibrados: ' + JSON.stringify(byCurrency));
     credits.sort((a, b) => a[0] - b[0]);
     for (const [accountId, value] of credits) {
       const { balance } = await db.get('UPDATE accounts SET balance = balance + ? WHERE id = ? RETURNING balance', value, accountId);
-      await db.run('INSERT INTO entries (tx_id, account_id, amount, balance_after) VALUES (?, ?, ?, ?)', id, accountId, value, balance);
+      await db.run('INSERT INTO entries (tx_id, account_id, amount, balance_after) VALUES (?, ?, ?, ?)', txId, accountId, value, balance);
     }
+  }
+
+  // Regista uma transação "especial" (sem passar por move) e os seus lançamentos.
+  async function recordTx({ type, fromAcc, toAcc, amount, currency, toAmount, toCurrency, rate = 1, fee = 0, note, createdBy, credits }) {
+    const id = crypto.randomUUID();
+    await db.run(`INSERT INTO transactions (id, type, from_account, to_account, amount, currency, to_amount, to_currency, rate, fee, note, created_by, idempotency_key, created_at, seq)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+    id, type, fromAcc.id, toAcc.id, amount, currency, toAmount, toCurrency, rate, fee, note ?? null, createdBy, now(), nextSeq());
+    await applyCredits(id, credits);
     return id;
   }
 
@@ -314,9 +336,9 @@ function createService(db, { adminPhone } = {}) {
 
   async function party(accountId) {
     const a = await accountById(accountId);
-    if (!a.user_id) return { name: a.kind === 'fees' ? 'Taxas' : C.APP_NAME, phone: null, user_id: null };
+    if (!a.user_id) return { name: { fees: 'Taxas', payout: 'Transferência bancária', system_float: C.APP_NAME, fx: 'Câmbio' }[a.kind] || C.APP_NAME, phone: null, user_id: null };
     const u = await userById(a.user_id);
-    return { name: u.name, phone: u.phone, country: u.country, user_id: u.id };
+    return { name: u.merchant_name || u.name, phone: u.phone, country: u.country, user_id: u.id, merchant: !!u.merchant_name };
   }
 
   async function txView(id, viewer) {
@@ -586,7 +608,7 @@ function createService(db, { adminPhone } = {}) {
     return listRates();
   }
 
-  async function setRole(admin, userId, { role, tier, status }, ip) {
+  async function setRole(admin, userId, { role, tier, status, merchantName }, ip) {
     requireRole(admin, 'admin');
     const u = await userById(Number(userId) || 0);
     if (!u) throw new ApiError(404, 'not_found', 'Utilizador não encontrado.');
@@ -596,16 +618,20 @@ function createService(db, { adminPhone } = {}) {
     if (status && !['active', 'blocked'].includes(status)) throw new ApiError(400, 'bad_status', 'Estado inválido.');
     await db.run('UPDATE users SET role = COALESCE(?, role), tier = COALESCE(?, tier), status = COALESCE(?, status) WHERE id = ?',
       role ?? null, tier ? Number(tier) : null, status ?? null, u.id);
+    // Conta de loja: nome comercial preenchido; texto vazio desliga.
+    if (merchantName !== undefined) {
+      await db.run('UPDATE users SET merchant_name = ? WHERE id = ?', cleanText(merchantName, 60), u.id);
+    }
     if (status === 'blocked') await db.run('DELETE FROM sessions WHERE user_id = ?', u.id);
-    await audit(admin.id, 'set_user', { user: u.id, role, tier, status }, ip);
+    await audit(admin.id, 'set_user', { user: u.id, role, tier, status, merchantName }, ip);
     return publicUser(await userById(u.id));
   }
 
   async function listUsers(admin, { search = '' } = {}) {
     requireRole(admin, 'admin');
     const pattern = `%${String(search).slice(0, 40)}%`;
-    const users = await db.all(`SELECT id, phone, country, name, role, tier, status, created_at FROM users
-                                WHERE phone ${like} ? OR name ${like} ? ORDER BY created_at DESC LIMIT 100`, pattern, pattern);
+    const users = await db.all(`SELECT id, phone, country, name, role, tier, status, merchant_name, created_at FROM users
+                                WHERE phone ${like} ? OR name ${like} ? OR merchant_name ${like} ? ORDER BY created_at DESC LIMIT 100`, pattern, pattern, pattern);
     return Promise.all(users.map(async (u) => ({
       ...u, wallets: (await walletsOf(u.id)).map((w) => ({ currency: w.currency, balance: w.balance })),
     })));
@@ -632,6 +658,7 @@ function createService(db, { adminPhone } = {}) {
         emoney: -(await internal('system_float', cur)).balance, // dinheiro eletrónico emitido (= o que tem de estar no banco)
         fees: (await internal('fees', cur)).balance,
         fx_position: (await internal('fx', cur)).balance,       // positivo = a mesa de câmbio tem; negativo = deve
+        payouts_pending: (await internal('payout', cur)).balance, // levantamentos bancários por pagar
       });
     }
     const eur = (k) => byCurrency.reduce((s, c) => s + toEur(c[k], c.currency, r), 0);
@@ -641,8 +668,363 @@ function createService(db, { adminPhone } = {}) {
       by_currency: byCurrency,
       totals_eur: { emoney: eur('emoney'), fees: eur('fees'), fx_result: eur('fx_position') },
       today: await db.get('SELECT COUNT(*) AS n FROM transactions WHERE created_at >= ?', startOfDay()),
+      pending_bank: await db.get("SELECT COUNT(*) AS n FROM bank_requests WHERE status = 'pending'"),
       ledger: await ledgerCheck(),
     };
+  }
+
+  // =====================================================================
+  // TRANSFERÊNCIAS BANCÁRIAS
+  // A empresa tem uma conta bancária por moeda (ex.: EUR na CGD, STN no
+  // BISTP). O cliente carrega a carteira transferindo para essa conta com uma
+  // referência única; o admin confirma quando o dinheiro aparece no extrato.
+  // Para levantar, o dinheiro sai logo da carteira (fica "por pagar") e o
+  // admin faz a transferência para o IBAN do cliente.
+  // =====================================================================
+  const bankAccountView = (b) => b && ({ currency: b.currency, bank_name: b.bank_name, holder: b.holder, iban: formatIban(b.iban), swift: b.swift, updated_at: b.updated_at });
+
+  async function listCompanyBankAccounts() {
+    return (await db.all('SELECT * FROM company_bank_accounts ORDER BY currency')).map(bankAccountView);
+  }
+
+  async function setCompanyBankAccount(admin, { currency, bankName, holder, iban, swift, pin }, ip) {
+    requireRole(admin, 'admin');
+    needCurrency(currency);
+    const ib = normalizeIban(iban || '');
+    if (!ib) throw new ApiError(400, 'bad_iban', 'IBAN inválido. Confirme os dígitos.');
+    const bn = cleanText(bankName, 80), h = cleanText(holder, 80);
+    if (!bn || !h) throw new ApiError(400, 'bad_bank', 'Indique o nome do banco e o titular da conta.');
+    await checkPin(admin, pin, ip);
+    await db.run(`INSERT INTO company_bank_accounts (currency, bank_name, holder, iban, swift, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+                  ON CONFLICT (currency) DO UPDATE SET bank_name = excluded.bank_name, holder = excluded.holder, iban = excluded.iban,
+                  swift = excluded.swift, updated_at = excluded.updated_at`, currency, bn, h, ib, cleanText(swift, 11), now());
+    await audit(admin.id, 'set_bank_account', { currency, bank: bn }, ip);
+    return listCompanyBankAccounts();
+  }
+
+  async function bankRequestView(r, { forAdmin = false } = {}) {
+    const company = r.kind === 'deposit' ? bankAccountView(await db.get('SELECT * FROM company_bank_accounts WHERE currency = ?', r.currency)) : null;
+    const v = {
+      id: r.id, kind: r.kind, amount: r.amount, currency: r.currency, fee: r.fee, reference: r.reference,
+      status: r.status, note: r.note, bank_reference: r.bank_reference, created_at: r.created_at, updated_at: r.updated_at,
+      iban: r.iban ? formatIban(r.iban) : null, holder: r.holder, pay_to: company,
+    };
+    if (forAdmin) {
+      const u = await userById(r.user_id);
+      v.user = { id: u.id, name: u.name, phone: u.phone, country: u.country };
+    }
+    return v;
+  }
+
+  async function uniqueReference(prefix) {
+    for (let i = 0; i < 10; i++) {
+      const ref = prefix + randomCode(6);
+      if (!(await db.get('SELECT 1 AS x FROM bank_requests WHERE reference = ?', ref))) return ref;
+    }
+    throw new Error('não foi possível gerar referência');
+  }
+
+  // Carregar: cria o pedido e mostra para onde transferir.
+  async function createBankDeposit(user, { amount, currency }, ip) {
+    const cur = needCurrency(currency || user.receive_currency);
+    const r = await rates();
+    if (!Number.isSafeInteger(amount) || toEur(amount, cur, r) < 100) throw new ApiError(400, 'bad_amount', `Valor mínimo: ${fmt(fromEur(100, cur, r), cur)}.`);
+    const company = await db.get('SELECT * FROM company_bank_accounts WHERE currency = ?', cur);
+    if (!company) throw new ApiError(409, 'no_bank', `Ainda não é possível carregar em ${cur} por transferência. Use um agente.`);
+    const { n } = await db.get("SELECT COUNT(*) AS n FROM bank_requests WHERE user_id = ? AND kind = 'deposit' AND status = 'pending'", user.id);
+    if (n >= 3) throw new ApiError(429, 'too_many_pending', 'Já tem 3 carregamentos pendentes. Aguarde a confirmação ou cancele um.');
+    const ref = await uniqueReference('DP');
+    const { id } = await db.get(`INSERT INTO bank_requests (user_id, kind, amount, currency, reference, created_at, updated_at)
+                                 VALUES (?, 'deposit', ?, ?, ?, ?, ?) RETURNING id`, user.id, amount, cur, ref, now(), now());
+    await audit(user.id, 'bank_deposit_request', { id, amount, cur }, ip);
+    return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', id));
+  }
+
+  async function quoteBankWithdrawal(user, { amount, currency }) {
+    const cur = needCurrency(currency || user.receive_currency);
+    const r = await rates();
+    return { amount, currency: cur, fee: feeFor('bankOut', amount, cur, r), total: amount + feeFor('bankOut', amount, cur, r), to_amount: amount, to_currency: cur, rate: 1 };
+  }
+
+  // Levantar para o banco: o dinheiro sai já da carteira para "por pagar".
+  async function createBankWithdrawal(user, { amount, currency, iban, holder, pin, idempotencyKey }, ip) {
+    const cur = needCurrency(currency || user.receive_currency);
+    const ib = normalizeIban(iban || '');
+    if (!ib) throw new ApiError(400, 'bad_iban', 'IBAN inválido. Confirme os dígitos (ex.: PT50 0000 0000 0000 0000 0000 0).');
+    const h = cleanText(holder, 80) || user.name;
+    if (!(await db.get('SELECT 1 AS x FROM company_bank_accounts WHERE currency = ?', cur))) {
+      throw new ApiError(409, 'no_bank', `Ainda não é possível levantar em ${cur} por transferência. Use um agente.`);
+    }
+    await checkPin(user, pin, ip);
+    const ref = await uniqueReference('LV');
+    const res = await idempotent(user, idempotencyKey, async (key) => {
+      const src = await walletOf(user.id, cur);
+      if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${cur}.`);
+      const quote = await buildQuote({ amount, from: cur, to: cur, feeKind: 'bankOut' });
+      const txId = await move({ type: 'bank_out', fromAcc: src, toAcc: await internal('payout', cur), quote,
+        note: `Levantamento para ${formatIban(ib)} (${ref})`, createdBy: user.id, idemKey: key });
+      await db.run(`INSERT INTO bank_requests (user_id, kind, amount, currency, fee, reference, iban, holder, tx_id, created_at, updated_at)
+                    VALUES (?, 'withdrawal', ?, ?, ?, ?, ?, ?, ?, ?, ?)`, user.id, amount, cur, quote.fee, ref, ib, h, txId, now(), now());
+      return txId;
+    });
+    const req = await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', res.transaction.id);
+    if (!res.replayed) await audit(user.id, 'bank_withdrawal_request', { id: req.id, amount, cur }, ip);
+    return { ...res, request: await bankRequestView(req) };
+  }
+
+  async function listMyBankRequests(user) {
+    const rows = await db.all('SELECT * FROM bank_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', user.id);
+    return Promise.all(rows.map((r) => bankRequestView(r)));
+  }
+
+  // Devolve à carteira um levantamento que não vai ser pago (valor + taxa).
+  async function refundWithdrawal(r, actorId, why) {
+    const wallet = await ensureWallet(r.user_id, r.currency);
+    const payout = await internal('payout', r.currency);
+    const credits = [[payout.id, -r.amount], [wallet.id, r.amount + r.fee]];
+    if (r.fee) credits.push([(await internal('fees', r.currency)).id, -r.fee]);
+    return recordTx({ type: 'refund', fromAcc: payout, toAcc: wallet, amount: r.amount + r.fee, currency: r.currency,
+      toAmount: r.amount + r.fee, toCurrency: r.currency, note: why, createdBy: actorId, credits });
+  }
+
+  async function lockedRequest(id, extra = '') {
+    const r = await db.get(`SELECT * FROM bank_requests WHERE id = ?${extra} FOR UPDATE`, Number(id) || 0);
+    if (!r) throw new ApiError(404, 'not_found', 'Pedido não encontrado.');
+    if (r.status !== 'pending') throw new ApiError(409, 'not_pending', 'Este pedido já foi tratado.');
+    return r;
+  }
+
+  async function cancelBankRequest(user, id, ip) {
+    const out = await db.tx(async () => {
+      const r = await lockedRequest(id, ` AND user_id = ${Number(user.id)}`);
+      let txId = null;
+      if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, user.id, `Levantamento cancelado (${r.reference})`);
+      await db.run("UPDATE bank_requests SET status = 'cancelled', final_tx_id = ?, updated_at = ? WHERE id = ?", txId, now(), r.id);
+      return r.id;
+    });
+    await audit(user.id, 'bank_request_cancelled', { id: out }, ip);
+    return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', out));
+  }
+
+  async function adminListBankRequests(admin, { status = 'pending' } = {}) {
+    requireRole(admin, 'admin');
+    const rows = status === 'all'
+      ? await db.all('SELECT * FROM bank_requests ORDER BY created_at DESC LIMIT 100')
+      : await db.all('SELECT * FROM bank_requests WHERE status = ? ORDER BY created_at ASC LIMIT 100', status);
+    return Promise.all(rows.map((r) => bankRequestView(r, { forAdmin: true })));
+  }
+
+  // O dinheiro chegou ao banco: credita a carteira com o valor RECEBIDO.
+  async function confirmBankDeposit(admin, id, { amount, bankReference, pin }, ip) {
+    requireRole(admin, 'admin');
+    await checkPin(admin, pin, ip);
+    const txId = await db.tx(async () => {
+      const r = await lockedRequest(id, " AND kind = 'deposit'");
+      const received = amount == null ? r.amount : amount;
+      if (!Number.isSafeInteger(received) || received < 1) throw new ApiError(400, 'bad_amount', 'Valor recebido inválido.');
+      const t = await move({ type: 'bank_in', fromAcc: await internal('system_float', r.currency), toAcc: await ensureWallet(r.user_id, r.currency),
+        quote: await buildQuote({ amount: received, from: r.currency, to: r.currency, feeKind: 'bankIn' }),
+        note: `Transferência bancária (${r.reference})`, createdBy: admin.id });
+      await db.run("UPDATE bank_requests SET status = 'completed', amount = ?, bank_reference = ?, tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
+        received, cleanText(bankReference, 80), t, admin.id, now(), r.id);
+      return t;
+    });
+    await audit(admin.id, 'bank_deposit_confirmed', { id, tx: txId }, ip);
+    return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', txId), { forAdmin: true });
+  }
+
+  // O admin já fez a transferência para o IBAN do cliente.
+  async function completeBankWithdrawal(admin, id, { bankReference, pin }, ip) {
+    requireRole(admin, 'admin');
+    const ref = cleanText(bankReference, 80);
+    if (!ref) throw new ApiError(400, 'bad_reference', 'Indique a referência da transferência feita no banco.');
+    await checkPin(admin, pin, ip);
+    await db.tx(async () => {
+      const r = await lockedRequest(id, " AND kind = 'withdrawal'");
+      const payout = await internal('payout', r.currency), float = await internal('system_float', r.currency);
+      const t = await recordTx({ type: 'bank_out', fromAcc: payout, toAcc: float, amount: r.amount, currency: r.currency,
+        toAmount: r.amount, toCurrency: r.currency, note: `Pago ao banco (${r.reference})`, createdBy: admin.id,
+        credits: [[payout.id, -r.amount], [float.id, r.amount]] }); // o dinheiro real saiu do banco da empresa
+      await db.run("UPDATE bank_requests SET status = 'completed', bank_reference = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
+        ref, t, admin.id, now(), r.id);
+    });
+    await audit(admin.id, 'bank_withdrawal_paid', { id }, ip);
+    return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', Number(id)), { forAdmin: true });
+  }
+
+  async function rejectBankRequest(admin, id, { reason, pin }, ip) {
+    requireRole(admin, 'admin');
+    const why = cleanText(reason, 140);
+    if (!why) throw new ApiError(400, 'bad_reason', 'Indique o motivo (o cliente vai vê-lo).');
+    await checkPin(admin, pin, ip);
+    await db.tx(async () => {
+      const r = await lockedRequest(id);
+      let txId = null;
+      if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, admin.id, `Levantamento recusado: ${why}`);
+      await db.run("UPDATE bank_requests SET status = 'rejected', note = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
+        why, txId, admin.id, now(), r.id);
+    });
+    await audit(admin.id, 'bank_request_rejected', { id, why }, ip);
+    return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', Number(id)), { forAdmin: true });
+  }
+
+  // ---------- Acerto entre bancos ----------
+  // Em cada moeda, o banco da empresa tem de ter pelo menos o dinheiro dos
+  // clientes (carteiras + levantamentos por pagar). A diferença vem das taxas
+  // e da mesa de câmbio: se for negativa, essa moeda precisa de receber
+  // dinheiro de outro banco da empresa (ex.: EUR da CGD → STN no BISTP).
+  async function settlementView(admin) {
+    requireRole(admin, 'admin');
+    const r = await rates();
+    const rows = [];
+    for (const cur of Object.keys(C.CURRENCIES)) {
+      const inBank = -(await internal('system_float', cur)).balance;
+      const { s: wallets } = await db.get("SELECT COALESCE(SUM(balance), 0) AS s FROM accounts WHERE kind = 'wallet' AND currency = ?", cur);
+      const payouts = (await internal('payout', cur)).balance;
+      const owed = Number(wallets) + payouts;
+      const surplus = inBank - owed; // = taxas + mesa de câmbio
+      rows.push({ currency: cur, in_bank: inBank, owed_to_customers: owed, surplus, surplus_eur: toEur(surplus, cur, r),
+        bank: bankAccountView(await db.get('SELECT * FROM company_bank_accounts WHERE currency = ?', cur)) });
+    }
+    // Sugestões: das moedas com excedente para as moedas em falta. As contas
+    // fazem-se em euros sem arredondar, e o valor a receber é o exato em falta.
+    const give = rows.filter((x) => x.surplus > 0).map((x) => ({ cur: x.currency, eur: x.surplus / r[x.currency] })).sort((a, b) => b.eur - a.eur);
+    const need = rows.filter((x) => x.surplus < 0).map((x) => ({ cur: x.currency, left: -x.surplus })).sort((a, b) => b.left / r[b.cur] - a.left / r[a.cur]);
+    const suggestions = [];
+    for (const n of need) {
+      for (const g of give) {
+        if (n.left <= 0) break;
+        if (g.eur <= 1e-9) continue;
+        const needEur = n.left / r[n.cur];
+        const eur = Math.min(needEur, g.eur);
+        const toAmount = eur === needEur ? n.left : Math.floor(eur * r[n.cur]);
+        if (toAmount < 1) continue;
+        suggestions.push({ from_currency: g.cur, to_currency: n.cur, amount: Math.ceil(eur * r[g.cur] - 1e-6), to_amount: toAmount, eur: Math.round(eur) });
+        n.left -= toAmount; g.eur -= eur;
+      }
+    }
+    return { rows, suggestions };
+  }
+
+  // Regista uma transferência feita entre dois bancos da empresa.
+  async function recordSettlement(admin, { fromCurrency, toCurrency, amount, toAmount, reference, pin }, ip) {
+    requireRole(admin, 'admin');
+    const from = needCurrency(fromCurrency), to = needCurrency(toCurrency);
+    if (from === to) throw new ApiError(400, 'same_currency', 'Escolha duas moedas diferentes.');
+    if (!Number.isSafeInteger(amount) || amount < 1 || !Number.isSafeInteger(toAmount) || toAmount < 1) throw new ApiError(400, 'bad_amount', 'Valores inválidos.');
+    const ref = cleanText(reference, 80);
+    if (!ref) throw new ApiError(400, 'bad_reference', 'Indique a referência da transferência bancária.');
+    await checkPin(admin, pin, ip);
+    const txId = await db.tx(async () => {
+      const fFloat = await internal('system_float', from), fFx = await internal('fx', from);
+      const tFloat = await internal('system_float', to), tFx = await internal('fx', to);
+      // Sai dinheiro real do banco "from" e entra no banco "to"; a mesa de câmbio acerta.
+      return recordTx({ type: 'settlement', fromAcc: fFx, toAcc: tFx, amount, currency: from, toAmount, toCurrency: to,
+        rate: Number((toAmount / amount).toPrecision(8)), note: `Acerto entre bancos: ${ref}`, createdBy: admin.id,
+        credits: [[fFloat.id, amount], [fFx.id, -amount], [tFx.id, toAmount], [tFloat.id, -toAmount]] });
+    });
+    await audit(admin.id, 'settlement', { tx: txId, from, to, amount, toAmount, ref }, ip);
+    return settlementView(admin);
+  }
+
+  // =====================================================================
+  // PAGAMENTOS EM LOJAS (QR)
+  // A loja cria uma cobrança (valor na moeda dela); o cliente lê o QR ou
+  // escreve o código e paga com qualquer carteira. A loja recebe o valor exato.
+  // =====================================================================
+  const requireMerchant = (u) => {
+    if (!u.merchant_name) throw new ApiError(403, 'not_merchant', 'Esta conta não é uma conta de loja. Peça ao administrador para a ativar.');
+  };
+
+  async function chargeView(c, viewer) {
+    const m = await userById(c.merchant_id);
+    const v = {
+      id: c.id, code: c.code, amount: c.amount, currency: c.currency, description: c.description,
+      status: c.status === 'pending' && c.expires_at < now() ? 'expired' : c.status,
+      expires_at: c.expires_at, created_at: c.created_at,
+      merchant: { name: m.merchant_name || m.name, country: m.country },
+    };
+    if (c.payer_id && viewer && viewer.id === c.merchant_id) {
+      const p = await userById(c.payer_id);
+      v.payer = { name: p.name, phone: p.phone };
+    }
+    return v;
+  }
+
+  async function createCharge(merchant, { amount, description }, ip) {
+    requireMerchant(merchant);
+    const cur = merchant.receive_currency;
+    if (!Number.isSafeInteger(amount) || toEur(amount, cur, await rates()) < C.MIN_AMOUNT_EUR) throw new ApiError(400, 'bad_amount', 'Valor inválido.');
+    for (let i = 0; i < 10; i++) {
+      const code = randomCode(6);
+      try {
+        const id = crypto.randomUUID();
+        await db.run(`INSERT INTO charges (id, code, merchant_id, amount, currency, description, expires_at, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, id, code, merchant.id, amount, cur, cleanText(description, 80),
+        now() + C.CHARGE_MINUTES * 60000, now());
+        await audit(merchant.id, 'charge_created', { id, amount, cur }, ip);
+        return chargeView(await db.get('SELECT * FROM charges WHERE id = ?', id), merchant);
+      } catch (err) { if (!isUniqueViolation(err)) throw err; }
+    }
+    throw new Error('não foi possível gerar código');
+  }
+
+  const findCharge = async (code) => {
+    const c = await db.get('SELECT * FROM charges WHERE code = ?', String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6));
+    if (!c) throw new ApiError(404, 'not_found', 'Código de pagamento não encontrado. Confirme as letras e números.');
+    return c;
+  };
+
+  // O cliente vê a cobrança e quanto vai pagar com a carteira escolhida.
+  async function getCharge(user, code, { fromCurrency } = {}) {
+    const c = await findCharge(code);
+    const view = await chargeView(c, user);
+    if (view.status === 'pending' && user.id !== c.merchant_id) {
+      const from = needCurrency(fromCurrency || user.receive_currency);
+      view.quote = await buildQuote({ from, to: c.currency, exactTo: c.amount, feeKind: 'merchant' });
+    }
+    return view;
+  }
+
+  async function payCharge(user, code, { fromCurrency, pin, idempotencyKey }, ip) {
+    const c0 = await findCharge(code);
+    if (c0.merchant_id === user.id) throw new ApiError(400, 'same_account', 'Não pode pagar a sua própria cobrança.');
+    const from = needCurrency(fromCurrency || user.receive_currency);
+    await checkPin(user, pin, ip);
+    const res = await idempotent(user, idempotencyKey, async (key) => {
+      const c = await db.get('SELECT * FROM charges WHERE id = ? FOR UPDATE', c0.id); // nunca paga a mesma cobrança duas vezes
+      if (c.status === 'paid') throw new ApiError(409, 'already_paid', 'Esta cobrança já foi paga.');
+      if (c.status !== 'pending') throw new ApiError(409, 'cancelled', 'Esta cobrança foi cancelada pela loja.');
+      if (c.expires_at < now()) throw new ApiError(410, 'expired', 'Esta cobrança expirou. Peça à loja um novo código.');
+      const src = await walletOf(user.id, from);
+      if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${from}.`);
+      const m = await userById(c.merchant_id);
+      const txId = await move({ type: 'merchant', fromAcc: src, toAcc: await ensureWallet(c.merchant_id, c.currency),
+        quote: await buildQuote({ from, to: c.currency, exactTo: c.amount, feeKind: 'merchant' }),
+        note: c.description || `Pagamento em ${m.merchant_name}`, createdBy: user.id, idemKey: key });
+      await db.run("UPDATE charges SET status = 'paid', payer_id = ?, tx_id = ? WHERE id = ?", user.id, txId, c.id);
+      return txId;
+    });
+    if (!res.replayed) await audit(user.id, 'charge_paid', { charge: c0.id, tx: res.transaction.id }, ip);
+    return res;
+  }
+
+  async function merchantCharge(merchant, id) {
+    const c = await db.get('SELECT * FROM charges WHERE id = ? AND merchant_id = ?', String(id), merchant.id);
+    if (!c) throw new ApiError(404, 'not_found', 'Cobrança não encontrada.');
+    return chargeView(c, merchant);
+  }
+
+  async function listMerchantCharges(merchant) {
+    requireMerchant(merchant);
+    const rows = await db.all('SELECT * FROM charges WHERE merchant_id = ? ORDER BY created_at DESC LIMIT 30', merchant.id);
+    return Promise.all(rows.map((c) => chargeView(c, merchant)));
+  }
+
+  async function cancelCharge(merchant, id) {
+    const done = await db.run("UPDATE charges SET status = 'cancelled' WHERE id = ? AND merchant_id = ? AND status = 'pending'", String(id), merchant.id);
+    if (!done.changes) throw new ApiError(409, 'not_pending', 'Esta cobrança já não pode ser cancelada.');
+    return merchantCharge(merchant, id);
   }
 
   return {
@@ -650,6 +1032,9 @@ function createService(db, { adminPhone } = {}) {
     quoteTransfer, quoteExchange, quoteRequest, quoteCashIn, quoteCashout,
     transfer, exchange, history, createRequest, listRequests, payRequest, closeRequest,
     cashIn, createCashoutCode, redeemCashout, issueFloat, listRates, setRate, setRole, listUsers, stats, ledgerCheck,
+    listCompanyBankAccounts, setCompanyBankAccount, createBankDeposit, quoteBankWithdrawal, createBankWithdrawal, listMyBankRequests,
+    cancelBankRequest, adminListBankRequests, confirmBankDeposit, completeBankWithdrawal, rejectBankRequest, settlementView, recordSettlement,
+    createCharge, getCharge, payCharge, merchantCharge, listMerchantCharges, cancelCharge,
   };
 }
 

@@ -62,6 +62,8 @@ function createApp(service) {
     return a;
   };
   const body = (req) => req.body || {};
+  // Endereço público da app (para os QR codes abrirem diretamente no telemóvel).
+  const origin = (req) => process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
 
   // Valor esperado do outro lado (o que o cliente viu na cotação), opcional.
   const expected = (v) => (v == null || v === '' ? undefined : Number.isSafeInteger(Number(v)) ? Number(v) : undefined);
@@ -134,13 +136,47 @@ function createApp(service) {
   // QR code para receber: o pagador lê-o e a app preenche o destinatário (e o valor, se houver).
   api.get('/me/qr.svg', auth, async (req, res, next) => {
     try {
-      const params = new URLSearchParams({ to: req.user.phone });
+      // É um endereço web: a câmara do iPhone ou do Android abre logo a app com o destinatário preenchido.
+      const params = new URLSearchParams({ enviar: req.user.phone });
       const a = req.query.amount ? parseAmount(String(req.query.amount)) : null;
-      if (a) params.set('amount', (a / 100).toFixed(2));
-      const svg = await QRCode.toString(`dobrapay:pay?${params}`, { type: 'svg', margin: 1, width: 260 });
+      if (a) params.set('valor', (a / 100).toFixed(2));
+      const svg = await QRCode.toString(`${origin(req)}/?${params}`, { type: 'svg', margin: 1, width: 260 });
       res.type('image/svg+xml').set('Cache-Control', 'no-store').send(svg);
     } catch (e) { next(e); }
   });
+
+  // ----- Transferências bancárias (cliente) -----
+  api.get('/bank/accounts', auth, wrap(() => service.listCompanyBankAccounts()));
+  api.get('/bank/requests', auth, wrap((req) => service.listMyBankRequests(req.user)));
+  api.post('/bank/deposits', auth, moneyLimit, wrap((req) => {
+    const b = body(req);
+    return service.createBankDeposit(req.user, { amount: amount(b.amount), currency: b.currency }, req.ip);
+  }));
+  api.get('/quote/bank-withdrawal', auth, wrap((req) => service.quoteBankWithdrawal(req.user, { amount: amount(req.query.amount), currency: req.query.currency })));
+  api.post('/bank/withdrawals', auth, moneyLimit, wrap((req) => {
+    const b = body(req);
+    return service.createBankWithdrawal(req.user, { amount: amount(b.amount), currency: b.currency, iban: b.iban, holder: b.holder,
+      pin: b.pin, idempotencyKey: b.idempotency_key }, req.ip);
+  }));
+  api.post('/bank/requests/:id/cancel', auth, wrap((req) => service.cancelBankRequest(req.user, req.params.id, req.ip)));
+
+  // ----- Pagamentos em lojas -----
+  api.post('/charges', auth, moneyLimit, wrap((req) => service.createCharge(req.user, { amount: amount(body(req).amount), description: body(req).description }, req.ip)));
+  api.get('/charges', auth, wrap((req) => service.listMerchantCharges(req.user)));
+  api.get('/charges/:id', auth, wrap((req) => service.merchantCharge(req.user, req.params.id)));
+  api.post('/charges/:id/cancel', auth, wrap((req) => service.cancelCharge(req.user, req.params.id)));
+  api.get('/charges/:id/qr.svg', auth, async (req, res, next) => {
+    try {
+      const c = await service.merchantCharge(req.user, req.params.id);
+      const svg = await QRCode.toString(`${origin(req)}/?pagar=${c.code}`, { type: 'svg', margin: 1, width: 260 });
+      res.type('image/svg+xml').set('Cache-Control', 'no-store').send(svg);
+    } catch (e) { next(e); }
+  });
+  api.get('/pay/:code', auth, lookupLimit, wrap((req) => service.getCharge(req.user, req.params.code, { fromCurrency: req.query.from_currency })));
+  api.post('/pay/:code', auth, moneyLimit, wrap((req) => {
+    const b = body(req);
+    return service.payCharge(req.user, req.params.code, { fromCurrency: b.from_currency, pin: b.pin, idempotencyKey: b.idempotency_key }, req.ip);
+  }));
 
   // ----- Agente -----
   api.get('/agent/quote', auth, lookupLimit, wrap((req) => service.quoteCashIn(req.user, { to: String(req.query.to || ''), amount: amount(req.query.amount) })));
@@ -154,7 +190,10 @@ function createApp(service) {
   // ----- Administração -----
   api.get('/admin/stats', auth, wrap((req) => service.stats(req.user)));
   api.get('/admin/users', auth, wrap((req) => service.listUsers(req.user, req.query)));
-  api.patch('/admin/users/:id', auth, wrap((req) => service.setRole(req.user, req.params.id, body(req), req.ip)));
+  api.patch('/admin/users/:id', auth, wrap((req) => {
+    const b = body(req);
+    return service.setRole(req.user, req.params.id, { role: b.role, tier: b.tier, status: b.status, merchantName: b.merchant_name }, req.ip);
+  }));
   api.post('/admin/float', auth, wrap((req) => {
     const b = body(req);
     return service.issueFloat(req.user, { agentPhone: b.agent_phone, reference: b.reference, pin: b.pin, amount: amount(b.amount), idempotencyKey: b.idempotency_key }, req.ip);
@@ -162,6 +201,27 @@ function createApp(service) {
   api.post('/admin/rates', auth, wrap((req) => {
     const b = body(req);
     return service.setRate(req.user, { currency: b.currency, perEur: b.per_eur, pin: b.pin }, req.ip);
+  }));
+
+  api.get('/admin/bank/requests', auth, wrap((req) => service.adminListBankRequests(req.user, { status: req.query.status })));
+  api.post('/admin/bank/requests/:id/confirm', auth, wrap((req) => {
+    const b = body(req);
+    return service.confirmBankDeposit(req.user, req.params.id, { amount: b.amount == null || b.amount === '' ? undefined : amount(b.amount),
+      bankReference: b.bank_reference, pin: b.pin }, req.ip);
+  }));
+  api.post('/admin/bank/requests/:id/paid', auth, wrap((req) => service.completeBankWithdrawal(req.user, req.params.id,
+    { bankReference: body(req).bank_reference, pin: body(req).pin }, req.ip)));
+  api.post('/admin/bank/requests/:id/reject', auth, wrap((req) => service.rejectBankRequest(req.user, req.params.id,
+    { reason: body(req).reason, pin: body(req).pin }, req.ip)));
+  api.post('/admin/bank/accounts', auth, wrap((req) => {
+    const b = body(req);
+    return service.setCompanyBankAccount(req.user, { currency: b.currency, bankName: b.bank_name, holder: b.holder, iban: b.iban, swift: b.swift, pin: b.pin }, req.ip);
+  }));
+  api.get('/admin/settlement', auth, wrap((req) => service.settlementView(req.user)));
+  api.post('/admin/settlement', auth, wrap((req) => {
+    const b = body(req);
+    return service.recordSettlement(req.user, { fromCurrency: b.from_currency, toCurrency: b.to_currency, amount: amount(b.amount),
+      toAmount: amount(b.to_amount), reference: b.reference, pin: b.pin }, req.ip);
   }));
 
   api.use((req, res, next) => next(new ApiError(404, 'not_found', 'Rota inexistente.')));

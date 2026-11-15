@@ -74,6 +74,25 @@ function verifyPin(pin, stored) {
 const isValidPin = (pin) => typeof pin === 'string' && /^\d{4,6}$/.test(pin)
   && !/^(\d)\1+$/.test(pin) && !['1234', '12345', '123456', '4321', '0123'].includes(pin);
 
+// IBAN: verifica o comprimento do país e o dígito de controlo (módulo 97).
+const IBAN_LENGTHS = { PT: 25, ES: 24, ST: 25, AO: 25, CV: 25, FR: 27, DE: 22, IT: 27, BE: 16, NL: 18, LU: 20, GB: 22, CH: 21, IE: 22 };
+function normalizeIban(input) {
+  if (typeof input !== 'string') return null;
+  const iban = input.replace(/[\s.-]/g, '').toUpperCase();
+  if (!/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(iban)) return null;
+  const len = IBAN_LENGTHS[iban.slice(0, 2)];
+  if (len && iban.length !== len) return null;
+  const digits = (iban.slice(4) + iban.slice(0, 4)).replace(/[A-Z]/g, (ch) => String(ch.charCodeAt(0) - 55));
+  let rest = 0;
+  for (const d of digits) rest = (rest * 10 + Number(d)) % 97;
+  return rest === 1 ? iban : null;
+}
+const formatIban = (iban) => iban.replace(/(.{4})/g, '$1 ').trim();
+
+// Códigos curtos fáceis de ler e escrever (sem 0/O, 1/I/L).
+const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+const randomCode = (len) => Array.from({ length: len }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
+
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
 function cleanText(s, max) {
@@ -82,4 +101,4 @@ function cleanText(s, max) {
   return t || null;
 }
 
-module.exports = { ApiError, normalizePhone, countryOfPhone, parseAmount, formatAmount, isCurrency, hashPin, verifyPin, isValidPin, sha256, cleanText };
+module.exports = { ApiError, normalizePhone, countryOfPhone, parseAmount, formatAmount, isCurrency, normalizeIban, formatIban, randomCode, hashPin, verifyPin, isValidPin, sha256, cleanText };

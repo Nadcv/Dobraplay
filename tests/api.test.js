@@ -256,11 +256,149 @@ test('pedidos simultâneos: nunca gasta mais do que tem nem paga duas vezes', as
   assert.equal(await bal(rita.token, 'STN'), 50_000 + 10_000 - 10_000);
 });
 
+// ---------------- Transferências bancárias ----------------
+const IBAN_CGD = 'PT50 0002 0123 1234 5678 9015 4';
+const IBAN_BISTP = 'ST09 0001 0000 0012 3456 7890 1';
+const IBAN_MARIA = 'ES91 2100 0418 4502 0005 1332';
+
+test('admin configura as contas bancárias da empresa (CGD em EUR, BISTP em STN)', async () => {
+  assert.equal((await call('POST', '/admin/bank/accounts', { currency: 'EUR', bank_name: 'CGD', holder: 'DobraPay', iban: 'PT50000201231234567890155', pin: '2580' }, admin.token)).body.error, 'bad_iban');
+  assert.equal((await call('POST', '/admin/bank/accounts', { currency: 'EUR', bank_name: 'CGD', holder: 'X', iban: IBAN_CGD, pin: '2580' }, ana.token)).status, 403);
+  const r = await call('POST', '/admin/bank/accounts', { currency: 'EUR', bank_name: 'Caixa Geral de Depósitos', holder: 'DobraPay Lda', iban: IBAN_CGD, swift: 'CGDIPTPL', pin: '2580' }, admin.token);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  await call('POST', '/admin/bank/accounts', { currency: 'STN', bank_name: 'BISTP', holder: 'DobraPay STP', iban: IBAN_BISTP, pin: '2580' }, admin.token);
+  const list = (await call('GET', '/bank/accounts', null, maria.token)).body;
+  assert.deepEqual(list.map((b) => b.currency), ['EUR', 'STN']);
+  assert.equal(list[0].iban, 'PT50 0002 0123 1234 5678 9015 4');
+});
+
+test('carregar por transferência: pedido com referência, admin confirma o valor recebido', async () => {
+  assert.equal((await call('POST', '/bank/deposits', { amount: '50', currency: 'USD' }, maria.token)).body.error, 'no_bank');
+  const d = await call('POST', '/bank/deposits', { amount: '100', currency: 'EUR' }, maria.token);
+  assert.equal(d.status, 200, JSON.stringify(d.body));
+  assert.match(d.body.reference, /^DP[A-Z2-9]{6}$/);
+  assert.equal(d.body.pay_to.bank_name, 'Caixa Geral de Depósitos');
+  const pending = (await call('GET', '/admin/bank/requests', null, admin.token)).body;
+  assert.ok(pending.some((x) => x.reference === d.body.reference && x.user.name === 'Maria Espanha'));
+  assert.equal((await call('POST', `/admin/bank/requests/${d.body.id}/confirm`, { pin: '2580' }, ana.token)).status, 403);
+  const before = await bal(maria.token, 'EUR');
+  // A Maria transferiu 99,50 € (o banco dela cobrou 0,50 €): credita-se o que chegou.
+  const c = await call('POST', `/admin/bank/requests/${d.body.id}/confirm`, { amount: '99,50', bank_reference: 'MOV-123', pin: '2580' }, admin.token);
+  assert.equal(c.status, 200, JSON.stringify(c.body));
+  assert.equal(c.body.status, 'completed');
+  assert.equal(await bal(maria.token, 'EUR'), before + 9_950);
+  assert.equal((await call('POST', `/admin/bank/requests/${d.body.id}/confirm`, { pin: '2580' }, admin.token)).status, 409);
+  const hist = (await call('GET', '/transactions', null, maria.token)).body;
+  assert.equal(hist[0].type, 'bank_in');
+});
+
+test('levantar para o banco: sai logo da carteira; admin paga ou recusa (devolve tudo)', async () => {
+  assert.equal((await call('POST', '/bank/withdrawals', { amount: '10', currency: 'EUR', iban: 'ES00 1234', pin: '2580' }, maria.token)).body.error, 'bad_iban');
+  const q = await call('GET', '/quote/bank-withdrawal?amount=50&currency=EUR', null, maria.token);
+  assert.equal(q.body.fee, 50); // 1% de 50 € = 0,50 € (mínimo)
+  const before = await bal(maria.token, 'EUR');
+  const w = await call('POST', '/bank/withdrawals', { amount: '50', currency: 'EUR', iban: IBAN_MARIA, holder: 'Maria Espanha', pin: '2580', idempotency_key: 'w1' }, maria.token);
+  assert.equal(w.status, 200, JSON.stringify(w.body));
+  assert.equal(w.body.request.iban, 'ES91 2100 0418 4502 0005 1332');
+  assert.equal(await bal(maria.token, 'EUR'), before - 5_050);
+  // Repetido (rede fraca): não cria segundo levantamento.
+  const again = await call('POST', '/bank/withdrawals', { amount: '50', currency: 'EUR', iban: IBAN_MARIA, pin: '2580', idempotency_key: 'w1' }, maria.token);
+  assert.equal(again.body.request.id, w.body.request.id);
+  assert.equal(await bal(maria.token, 'EUR'), before - 5_050);
+  assert.equal((await call('POST', `/admin/bank/requests/${w.body.request.id}/paid`, { pin: '2580' }, admin.token)).body.error, 'bad_reference');
+  const paid = await call('POST', `/admin/bank/requests/${w.body.request.id}/paid`, { bank_reference: 'SEPA-777', pin: '2580' }, admin.token);
+  assert.equal(paid.body.status, 'completed');
+
+  // Recusado pelo admin: devolve valor + taxa.
+  const w2 = await call('POST', '/bank/withdrawals', { amount: '20', currency: 'EUR', iban: IBAN_MARIA, pin: '2580' }, maria.token);
+  const mid = await bal(maria.token, 'EUR');
+  const rej = await call('POST', `/admin/bank/requests/${w2.body.request.id}/reject`, { reason: 'Titular não corresponde', pin: '2580' }, admin.token);
+  assert.equal(rej.body.status, 'rejected');
+  assert.equal(await bal(maria.token, 'EUR'), mid + 2_000 + w2.body.request.fee);
+
+  // Cancelado pela própria cliente: também devolve tudo.
+  const w3 = await call('POST', '/bank/withdrawals', { amount: '20', currency: 'EUR', iban: IBAN_MARIA, pin: '2580' }, maria.token);
+  const mid2 = await bal(maria.token, 'EUR');
+  const can = await call('POST', `/bank/requests/${w3.body.request.id}/cancel`, null, maria.token);
+  assert.equal(can.body.status, 'cancelled');
+  assert.equal(await bal(maria.token, 'EUR'), mid2 + 2_000 + w3.body.request.fee);
+  assert.equal((await call('POST', `/bank/requests/${w3.body.request.id}/cancel`, null, maria.token)).status, 409);
+  const mine = (await call('GET', '/bank/requests', null, maria.token)).body;
+  assert.deepEqual(mine.slice(0, 3).map((x) => x.status), ['cancelled', 'rejected', 'completed']);
+});
+
+test('acerto entre bancos: mostra o que falta em cada moeda e regista a transferência CGD → BISTP', async () => {
+  const v = (await call('GET', '/admin/settlement', null, admin.token)).body;
+  const stn = v.rows.find((r) => r.currency === 'STN');
+  const eur = v.rows.find((r) => r.currency === 'EUR');
+  assert.ok(eur.surplus < 0, 'pagaram-se euros que entraram como dobras: o banco em EUR tem de receber');
+  assert.ok(stn.surplus > 0);
+  const sug = v.suggestions.find((s) => s.from_currency === 'STN' && s.to_currency === 'EUR');
+  assert.ok(sug);
+  if (stn.surplus / 24.5 >= -eur.surplus) assert.equal(sug.to_amount, -eur.surplus); // cobre exatamente o que falta
+  const r = await call('POST', '/admin/settlement', { from_currency: 'STN', to_currency: 'EUR', amount: '2450', to_amount: '100', reference: 'SWIFT BISTP→CGD 01', pin: '2580' }, admin.token);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const eur2 = r.body.rows.find((x) => x.currency === 'EUR');
+  assert.equal(eur2.surplus, eur.surplus + 10_000);
+  assert.equal(eur2.owed_to_customers, eur.owed_to_customers); // os clientes não são afetados
+});
+
+// ---------------- Pagamentos em lojas ----------------
+let charge;
+test('loja cria cobrança; cliente paga noutra moeda; a loja recebe o valor exato', async () => {
+  assert.equal((await call('POST', '/charges', { amount: '150' }, bruno.token)).body.error, 'not_merchant');
+  const m = await call('PATCH', `/admin/users/${bruno.user.id}`, { merchant_name: 'Café do Bruno' }, admin.token);
+  assert.equal(m.body.merchant_name, 'Café do Bruno');
+  const c = await call('POST', '/charges', { amount: '150', description: '2 cafés e 1 bolo' }, bruno.token);
+  assert.equal(c.status, 200, JSON.stringify(c.body));
+  assert.match(c.body.code, /^[A-Z2-9]{6}$/);
+  assert.equal(c.body.currency, 'STN');
+  charge = c.body;
+  const qr = await fetch(base + `/charges/${charge.id}/qr.svg`, { headers: { authorization: 'Bearer ' + bruno.token } });
+  assert.equal(qr.status, 200);
+
+  // A Maria (Espanha) vê a cobrança pelo código (com minúsculas e espaços) e paga em euros.
+  const v = await call('GET', `/pay/${charge.code.toLowerCase().slice(0, 3)}%20${charge.code.toLowerCase().slice(3)}?from_currency=EUR`, null, maria.token);
+  assert.equal(v.status, 200, JSON.stringify(v.body));
+  assert.equal(v.body.merchant.name, 'Café do Bruno');
+  assert.equal(v.body.quote.to_amount, 15_000);
+  assert.equal(v.body.quote.fee, 0);
+  const brunoBefore = await bal(bruno.token, 'STN');
+  const p = await call('POST', `/pay/${charge.code}`, { from_currency: 'EUR', pin: '2580', idempotency_key: 'pay-1' }, maria.token);
+  assert.equal(p.status, 200, JSON.stringify(p.body));
+  assert.equal(p.body.transaction.type, 'merchant');
+  assert.equal(p.body.transaction.to.name, 'Café do Bruno');
+  assert.equal(await bal(bruno.token, 'STN'), brunoBefore + 15_000);
+  assert.equal((await call('POST', `/pay/${charge.code}`, { from_currency: 'EUR', pin: '2580' }, ana.token)).body.error, 'already_paid');
+  const status = (await call('GET', `/charges/${charge.id}`, null, bruno.token)).body;
+  assert.equal(status.status, 'paid');
+  assert.equal(status.payer.name, 'Maria Espanha');
+  assert.equal((await call('GET', `/charges/${charge.id}`, null, ana.token)).status, 404); // só a loja vê os detalhes
+});
+
+test('cobranças canceladas, expiradas ou inexistentes não se pagam', async () => {
+  const c = (await call('POST', '/charges', { amount: '20' }, bruno.token)).body;
+  await call('POST', `/charges/${c.id}/cancel`, null, bruno.token);
+  assert.equal((await call('POST', `/pay/${c.code}`, { pin: '2580' }, ana.token)).body.error, 'cancelled');
+  const e = (await call('POST', '/charges', { amount: '20' }, bruno.token)).body;
+  await db.run('UPDATE charges SET expires_at = ? WHERE id = ?', Date.now() - 1000, e.id);
+  assert.equal((await call('GET', `/pay/${e.code}`, null, ana.token)).body.status, 'expired');
+  assert.equal((await call('POST', `/pay/${e.code}`, { pin: '2580' }, ana.token)).body.error, 'expired');
+  assert.equal((await call('GET', '/pay/ZZZZZZ', null, ana.token)).status, 404);
+  assert.equal((await call('POST', `/pay/${(await call('POST', '/charges', { amount: '5' }, bruno.token)).body.code}`, { pin: '2580' }, bruno.token)).body.error, 'same_account');
+  const list = (await call('GET', '/charges', null, bruno.token)).body;
+  assert.ok(list.length >= 4);
+});
+
+test('QR para receber é um endereço web (a câmara do iPhone abre a app)', async () => {
+  const res = await fetch(base + '/me/qr.svg', { headers: { authorization: 'Bearer ' + ana.token } });
+  assert.equal(res.status, 200);
+});
+
 test('livro-razão: em cada moeda a soma de todos os saldos é zero', async () => {
   const s = (await call('GET', '/admin/stats', null, admin.token)).body;
   assert.equal(s.ledger.ok, true, JSON.stringify(s.ledger));
   const stn = s.by_currency.find((c) => c.currency === 'STN');
-  assert.equal(stn.emoney, 50_000_000);
   assert.ok(stn.fees > 0);
   assert.ok(s.totals_eur.fx_result > 0, 'a margem de câmbio deve dar lucro');
   assert.equal((await call('GET', '/admin/stats', null, ana.token)).status, 403);

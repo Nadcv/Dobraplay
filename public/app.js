@@ -187,16 +187,24 @@ async function showHome() {
   $('#auth').hidden = true;
   $('#home').hidden = false;
   await refresh();
+  // Veio de um QR code lido com a câmara do telemóvel: abre logo o ecrã certo.
+  const link = JSON.parse(sessionStorage.getItem('dp_link') || 'null');
+  if (link && state.me) {
+    sessionStorage.removeItem('dp_link');
+    if (link.pagar) openSheet('pay', { code: link.pagar });
+    else if (link.enviar) openSheet('send', { to: link.enviar, amount: link.valor ? link.valor.replace('.', ',') : '' });
+  }
 }
 
 async function refresh() {
   if (!state.token) return;
   try {
-    const [me, txs, reqs] = await Promise.all([api('GET', '/me'), api('GET', '/transactions?limit=30'), api('GET', '/requests')]);
+    const [me, txs, reqs, bank] = await Promise.all([api('GET', '/me'), api('GET', '/transactions?limit=30'), api('GET', '/requests'), api('GET', '/bank/requests')]);
     state.me = me;
     renderMe();
     renderHistory(txs);
-    renderPending(reqs);
+    renderPending(reqs, bank);
+    if (me.role === 'admin') api('GET', '/admin/bank/requests').then((r) => { $('#bankBadge').textContent = r.length || ''; }).catch(() => {});
   } catch (err) { if (state.token) toast(err.message, true); }
 }
 
@@ -211,6 +219,8 @@ function renderMe() {
   $('#limits').textContent = m.limits.daily ? `Limite diário: ${money(m.limits.dailyUsed, 'EUR')} de ${money(m.limits.daily, 'EUR')} usados` : '';
   $('#agentBar').hidden = !['agent', 'admin'].includes(m.role);
   $('#adminBar').hidden = m.role !== 'admin';
+  $('#merchantBar').hidden = !m.merchant_name;
+  if (m.merchant_name) $('#merchantName').textContent = '🏪 ' + m.merchant_name;
 }
 
 $('#balance').addEventListener('click', () => {
@@ -219,8 +229,9 @@ $('#balance').addEventListener('click', () => {
   renderMe();
 });
 
-const TX_LABEL = { p2p: 'Transferência', request: 'Pedido pago', cash_in: 'Depósito', cash_out: 'Levantamento', issue: 'Float emitido', exchange: 'Câmbio' };
-const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄' };
+const TX_LABEL = { p2p: 'Transferência', request: 'Pedido pago', cash_in: 'Depósito', cash_out: 'Levantamento', issue: 'Float emitido', exchange: 'Câmbio',
+  bank_in: 'Carregamento por banco', bank_out: 'Levantamento para o banco', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
+const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄', bank_in: '🏦', bank_out: '🏦', merchant: '🛒', refund: '↩', settlement: '🏦' };
 
 function renderHistory(txs) {
   const ul = $('#history');
@@ -235,7 +246,7 @@ function renderHistory(txs) {
       title = `${flagOf(t.to.country)} ${t.to.name}`;
       amt = esc(`-${money(t.amount + t.fee, t.currency)}`);
     } else {
-      title = `${flagOf(t.from.country)} ${t.from.name}`;
+      title = t.type === 'bank_in' ? 'Transferência bancária' : `${flagOf(t.from.country)} ${t.from.name}`;
       amt = esc(`+${money(t.to_amount, t.to_currency)}`);
     }
     const conv = t.currency !== t.to_currency && t.direction !== 'self'
@@ -249,9 +260,15 @@ function renderHistory(txs) {
   }).join('');
 }
 
-function renderPending(reqs) {
+function renderPending(reqs, bank = []) {
   const incoming = reqs.filter((r) => r.incoming && r.status === 'pending');
-  $('#pending').innerHTML = incoming.map((r) => `
+  const bankPending = bank.filter((b) => b.status === 'pending');
+  $('#pending').innerHTML = bankPending.map((b) => `
+    <div class="pending-card">
+      <div>🏦 ${b.kind === 'deposit' ? 'Carregamento' : 'Levantamento'} de <strong>${esc(money(b.amount, b.currency))}</strong> · ref. <strong>${esc(b.reference)}</strong>
+        <br><small>${b.kind === 'deposit' ? 'À espera da sua transferência bancária' : 'Em processamento pelo banco'}</small></div>
+      <button type="button" class="btn small" data-bankreq="${b.id}">Ver</button>
+    </div>`).join('') + incoming.map((r) => `
     <div class="pending-card">
       <div>${flagOf(r.requester.country)} <strong>${esc(r.requester.name)}</strong> pede <strong>${esc(money(r.amount, r.currency))}</strong>${r.note ? '<br><small>' + esc(r.note) + '</small>' : ''}</div>
       <button type="button" class="btn small" data-decline="${r.id}">Recusar</button>
@@ -259,6 +276,9 @@ function renderPending(reqs) {
     </div>`).join('');
   $('#pending').querySelectorAll('[data-pay]').forEach((b) => b.addEventListener('click', () => {
     openSheet('payRequest', incoming.find((x) => String(x.id) === b.dataset.pay));
+  }));
+  $('#pending').querySelectorAll('[data-bankreq]').forEach((b) => b.addEventListener('click', () => {
+    openSheet('bankRequest', bankPending.find((x) => String(x.id) === b.dataset.bankreq));
   }));
   $('#pending').querySelectorAll('[data-decline]').forEach((b) => b.addEventListener('click', async () => {
     try { await api('POST', `/requests/${b.dataset.decline}/decline`); toast('Pedido recusado.'); refresh(); }
@@ -354,7 +374,7 @@ const SHEETS = {
   }),
 
   cashout: () => ({
-    title: 'Levantar dinheiro',
+    title: 'Levantar num agente',
     html: `<form>
       <p class="hint" style="margin:0 0 14px">Gere um código e mostre-o a um agente DobraPay no país onde está. O agente entrega-lhe o dinheiro vivo.</p>
       <div class="row">${amountField('Quero levantar')}<label>Em<select name="currency">${currencyOptions(state.me.home_currency, [...new Set(Object.values(CFG.countries).map((c) => c.currency))])}</select></label></div>
@@ -463,6 +483,240 @@ const SHEETS = {
     },
   }),
 
+
+  // ---------- Carregar / Levantar: escolher como ----------
+  topup: () => ({
+    title: 'Carregar a carteira',
+    html: `<button type="button" class="choice" data-go="bankin"><span>🏦</span><div><strong>Por transferência bancária</strong><small>Do seu banco para a conta da DobraPay (ex.: MB Way/homebanking em Portugal, BISTP em São Tomé).</small></div></button>
+      <button type="button" class="choice" data-go="agentInfo"><span>🧑🏾‍💼</span><div><strong>Em dinheiro, num agente</strong><small>Entregue o dinheiro a um agente DobraPay e ele carrega a sua carteira na hora.</small></div></button>`,
+  }),
+  withdraw: () => ({
+    title: 'Levantar dinheiro',
+    html: `<button type="button" class="choice" data-go="cashout"><span>💵</span><div><strong>Em dinheiro, num agente</strong><small>Gere um código e receba o dinheiro em mão.</small></div></button>
+      <button type="button" class="choice" data-go="bankout"><span>🏦</span><div><strong>Para a minha conta bancária</strong><small>Transferência para o seu IBAN (Portugal, Espanha, São Tomé, Angola, Cabo Verde…).</small></div></button>`,
+  }),
+  agentInfo: () => ({
+    title: 'Carregar num agente',
+    html: `<div class="center"><p>Vá a um agente DobraPay e diga-lhe o seu número:</p>
+      <p class="big-code" style="font-size:1.5rem;letter-spacing:1px">${esc(prettyPhone(state.me.phone))}</p>
+      <p class="hint">Entregue o dinheiro e o saldo aparece na sua carteira em segundos. Confirme sempre na app antes de sair.</p>
+      <button type="button" class="btn primary" data-close>Entendido</button></div>`,
+  }),
+
+  bankin: () => ({
+    title: 'Carregar por transferência',
+    html: `<form><div data-banks><p class="hint">A carregar…</p></div>
+      <div class="row">${amountField('Valor a transferir')}<label>Moeda<select name="currency"></select></label></div>
+      <p class="hint">Vamos dar-lhe os dados bancários e uma referência. O saldo entra quando a transferência chegar (normalmente no mesmo dia em Portugal/Espanha; 1 a 3 dias entre países).</p>
+      <button class="btn primary">Obter dados para transferir</button></form>`,
+    setup: async (root) => {
+      const banks = await api('GET', '/bank/accounts');
+      const sel = $('[name=currency]', root);
+      if (!banks.length) { $('[data-banks]', root).innerHTML = '<p class="who err">Ainda não há contas bancárias disponíveis. Use um agente.</p>'; return; }
+      $('[data-banks]', root).innerHTML = '';
+      sel.innerHTML = currencyOptions(banks.some((b) => b.currency === state.me.receive_currency) ? state.me.receive_currency : banks[0].currency, banks.map((b) => b.currency));
+    },
+    submit: async (f) => {
+      const r = await api('POST', '/bank/deposits', { amount: f.get('amount'), currency: f.get('currency') });
+      refresh();
+      openSheet('bankRequest', r);
+    },
+  }),
+
+  bankRequest: (r) => ({
+    title: r.kind === 'deposit' ? 'Dados para a transferência' : 'Levantamento para o banco',
+    html: `${r.kind === 'deposit' && r.status === 'pending' ? `<p>Faça uma transferência a partir do <strong>seu</strong> banco com estes dados:</p>
+      <div class="summary">
+        ${copyRow('Banco', r.pay_to.bank_name)}${copyRow('Titular', r.pay_to.holder)}${copyRow('IBAN', r.pay_to.iban, r.pay_to.iban.replace(/\s/g, ''))}
+        ${r.pay_to.swift ? copyRow('SWIFT/BIC', r.pay_to.swift) : ''}${copyRow('Valor', money(r.amount, r.currency), (r.amount / 100).toFixed(2).replace('.', ','))}
+        ${copyRow('Descritivo / referência', r.reference)}
+      </div>
+      <p class="hint">⚠️ Escreva a referência <strong>${esc(r.reference)}</strong> no descritivo da transferência, senão não conseguimos saber que é sua. A conta tem de estar no seu nome.</p>`
+    : `<div class="summary"><div><span>Valor</span><strong>${esc(money(r.amount, r.currency))}</strong></div>
+        ${r.fee ? `<div><span>Taxa</span><span>${esc(money(r.fee, r.currency))}</span></div>` : ''}
+        ${r.iban ? `<div><span>Para</span><span>${esc(r.iban)}</span></div>` : ''}
+        <div><span>Referência</span><span>${esc(r.reference)}</span></div>
+        <div><span>Estado</span><span class="tag ${r.status}">${esc(STATUS[r.status] || r.status)}</span></div>
+        ${r.note ? `<div><span>Motivo</span><span>${esc(r.note)}</span></div>` : ''}</div>`}
+      ${r.status === 'pending' ? '<button type="button" class="btn danger" data-cancel style="width:100%;margin-bottom:10px">Cancelar pedido</button>' : ''}
+      <button type="button" class="btn primary" data-close>Fechar</button>`,
+    setup: (root) => {
+      bindCopy(root);
+      const c = $('[data-cancel]', root);
+      if (c) c.addEventListener('click', async () => {
+        try { await api('POST', `/bank/requests/${r.id}/cancel`); done(r.kind === 'withdrawal' ? 'Levantamento cancelado. O dinheiro voltou à carteira.' : 'Pedido cancelado.'); }
+        catch (err) { toast(err.message, true); }
+      });
+    },
+  }),
+
+  bankout: () => ({
+    title: 'Levantar para o banco',
+    html: `<form><div data-banks></div>
+      <label>Da carteira<select name="currency"></select></label>
+      ${amountField('Valor a receber no banco')}${quoteBox}
+      <label>IBAN da sua conta<input name="iban" autocomplete="off" placeholder="PT50 0000 0000 0000 0000 0000 0" required style="text-transform:uppercase"></label>
+      <label>Titular da conta<input name="holder" maxlength="80" value="${esc(state.me.name)}"></label>
+      ${pinField}<button class="btn primary">Pedir transferência</button></form>`,
+    setup: async (root) => {
+      const banks = (await api('GET', '/bank/accounts')).map((b) => b.currency);
+      const mine = state.me.wallets.filter((w) => banks.includes(w.currency));
+      if (!mine.length) { $('[data-banks]', root).innerHTML = '<p class="who err">Ainda não é possível levantar para o banco nas suas moedas. Use um agente.</p>'; return; }
+      $('[name=currency]', root).innerHTML = mine.map((w) => `<option value="${w.currency}">${w.currency} · saldo ${esc(money(w.balance, w.currency))}</option>`).join('');
+    },
+    quote: (f) => (f.get('currency') ? api('GET', '/quote/bank-withdrawal?' + qs({ amount: f.get('amount'), currency: f.get('currency') })) : null),
+    quoteOpts: { payLabel: 'Valor', getLabel: 'Recebe no banco' },
+    submit: async (f, key) => {
+      const r = await api('POST', '/bank/withdrawals', { amount: f.get('amount'), currency: f.get('currency'), iban: f.get('iban'),
+        holder: f.get('holder'), pin: f.get('pin'), idempotency_key: key });
+      refresh();
+      openSheet('bankRequest', r.request);
+      toast('Pedido registado. O dinheiro já saiu da carteira e vai ser transferido para o seu banco.');
+    },
+  }),
+
+  // ---------- Pagar numa loja ----------
+  pay: (pre = {}) => ({
+    title: 'Pagar numa loja',
+    html: `<form>
+      <label>Código mostrado pela loja<input name="code" class="code-input" maxlength="7" autocomplete="off" autocapitalize="characters" value="${esc(pre.code || '')}" placeholder="K7Q2P9" required></label>
+      ${'BarcodeDetector' in window ? '<button type="button" class="btn small" data-scan style="margin:-6px 0 14px">📷 Ler QR code</button>' : '<p class="hint">Dica: também pode apontar a câmara do telemóvel ao QR code da loja.</p>'}
+      <div data-charge></div>
+      <div data-payfields hidden>${fromWalletField()}${quoteBox}${pinField}<button class="btn primary">Pagar</button></div>
+      <input type="hidden" name="amount" value="1"></form>`,
+    setup: (root) => {
+      const form = $('form', root);
+      const box = $('[data-charge]', root), fields = $('[data-payfields]', root);
+      const load = debounce(async () => {
+        const code = form.code.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        form.dataset.charge = '';
+        if (code.length !== 6) { box.innerHTML = ''; fields.hidden = true; return; }
+        try {
+          const c = await api('GET', `/pay/${code}?` + qs({ from_currency: form.from_currency.value }));
+          box.innerHTML = `<div class="summary"><div><span>Loja</span><strong>${flagOf(c.merchant.country)} ${esc(c.merchant.name)}</strong></div>
+            ${c.description ? `<div><span>Descrição</span><span>${esc(c.description)}</span></div>` : ''}
+            <div><span>Valor</span><strong>${esc(money(c.amount, c.currency))}</strong></div>
+            ${c.status !== 'pending' ? `<div><span>Estado</span><span class="tag ${c.status}">${esc(STATUS[c.status] || c.status)}</span></div>` : ''}</div>`;
+          fields.hidden = c.status !== 'pending';
+          if (c.status === 'pending') { form.dataset.charge = code; form.dispatchEvent(new Event('change')); } // atualiza a cotação
+        } catch (err) { box.innerHTML = `<p class="who err">${esc(err.message)}</p>`; fields.hidden = true; }
+      }, 300);
+      form.code.addEventListener('input', load);
+      load();
+    },
+    quote: (f, form) => (form.dataset.charge ? api('GET', `/pay/${form.dataset.charge}?` + qs({ from_currency: f.get('from_currency') })).then((c) => c.quote) : null),
+    quoteOpts: { payLabel: 'Paga', getLabel: 'A loja recebe' },
+    submit: async (f, key, form) => {
+      if (!form.dataset.charge) throw new Error('Escreva o código de 6 letras e números da loja.');
+      const r = await api('POST', `/pay/${form.dataset.charge}`, { from_currency: f.get('from_currency'), pin: f.get('pin'), idempotency_key: key });
+      done(`Pago ✓ ${money(r.transaction.to_amount, r.transaction.to_currency)} a ${r.transaction.to.name}.`);
+    },
+  }),
+
+  // ---------- Loja: cobrar ----------
+  charge: () => ({
+    title: 'Cobrar a um cliente',
+    html: `<form>${amountField(`Valor (${esc(state.me.receive_currency)})`)}
+      <label>Descrição (opcional)<input name="description" maxlength="80" placeholder="Ex.: 2 cafés"></label>
+      <p class="hint">O cliente pode pagar com qualquer moeda; a loja recebe sempre o valor exato em ${esc(state.me.receive_currency)}.</p>
+      <button class="btn primary">Gerar QR code</button></form>`,
+    submit: async (f) => {
+      const c = await api('POST', '/charges', { amount: f.get('amount'), description: f.get('description') });
+      showCharge(c);
+    },
+  }),
+
+  charges: () => ({
+    title: 'Cobranças recentes',
+    html: '<div data-list><p class="hint">A carregar…</p></div>',
+    setup: async (root) => {
+      const list = await api('GET', '/charges');
+      $('[data-list]', root).innerHTML = list.map((c) => `<div class="req-card"><div class="copy-row"><div><strong>${esc(money(c.amount, c.currency))}</strong>
+        <small>${esc(when(c.created_at))}${c.description ? ' · ' + esc(c.description) : ''}${c.payer ? ' · ' + esc(c.payer.name) : ''}</small></div>
+        <span class="tag ${c.status}">${esc(STATUS[c.status] || c.status)}</span></div></div>`).join('') || '<p class="empty">Ainda sem cobranças.</p>';
+    },
+  }),
+
+  // ---------- Admin: banco ----------
+  bankAdmin: () => ({
+    title: 'Transferências bancárias',
+    html: `<label>O seu PIN (para confirmar operações)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label>
+      <div data-reqs><p class="hint">A carregar…</p></div>`,
+    setup: async (root) => {
+      const pin = () => $('[data-adminpin]', root).value;
+      const load = async () => {
+        const reqs = await api('GET', '/admin/bank/requests');
+        $('#bankBadge').textContent = reqs.length || '';
+        $('[data-reqs]', root).innerHTML = reqs.map((r) => `<div class="req-card" data-id="${r.id}">
+          <div class="copy-row"><div><strong>${r.kind === 'deposit' ? '⬇ Carregamento' : '⬆ Levantamento'} · ${esc(money(r.amount, r.currency))}</strong>
+            <small>${flagOf(r.user.country)} ${esc(r.user.name)} · ${esc(prettyPhone(r.user.phone))} · ${esc(when(r.created_at))}</small></div>
+            <span class="tag">${esc(r.reference)}</span></div>
+          ${r.kind === 'deposit'
+            ? `<p class="hint" style="margin:6px 0">Confirme no extrato do banco (${esc(r.pay_to ? r.pay_to.bank_name : r.currency)}) uma transferência com a referência <strong>${esc(r.reference)}</strong>.</p>
+               <div class="row"><input data-amount inputmode="decimal" placeholder="Valor recebido" value="${(r.amount / 100).toFixed(2).replace('.', ',')}"><input data-ref placeholder="Ref. do extrato"></div>`
+            : `<p class="hint" style="margin:6px 0">Transferir <strong>${esc(money(r.amount, r.currency))}</strong> para <strong>${esc(r.iban)}</strong> (${esc(r.holder)}) com o descritivo ${esc(r.reference)}.</p>
+               <input data-ref placeholder="Referência da transferência feita">`}
+          <div class="row"><button type="button" class="btn small primary" data-ok>${r.kind === 'deposit' ? 'Confirmar recebido' : 'Marcar como pago'}</button>
+            <button type="button" class="btn small danger" data-no>Recusar</button></div></div>`).join('') || '<p class="empty">Não há pedidos pendentes. ✓</p>';
+        root.querySelectorAll('.req-card').forEach((card) => {
+          const r = reqs.find((x) => String(x.id) === card.dataset.id);
+          const act = async (fn, msg) => { try { await fn(); toast(msg); load(); refresh(); } catch (err) { toast(err.message, true); } };
+          $('[data-ok]', card).addEventListener('click', () => act(() => (r.kind === 'deposit'
+            ? api('POST', `/admin/bank/requests/${r.id}/confirm`, { amount: $('[data-amount]', card).value, bank_reference: $('[data-ref]', card).value, pin: pin() })
+            : api('POST', `/admin/bank/requests/${r.id}/paid`, { bank_reference: $('[data-ref]', card).value, pin: pin() })),
+          r.kind === 'deposit' ? 'Carregamento confirmado.' : 'Levantamento marcado como pago.'));
+          $('[data-no]', card).addEventListener('click', () => {
+            const reason = prompt('Motivo da recusa (o cliente vai ver):');
+            if (reason) act(() => api('POST', `/admin/bank/requests/${r.id}/reject`, { reason, pin: pin() }), 'Pedido recusado.');
+          });
+        });
+      };
+      await load();
+    },
+  }),
+
+  settlement: () => ({
+    title: 'Bancos da empresa e acertos',
+    html: `<div data-view><p class="hint">A carregar…</p></div>
+      <h3 style="font-size:1rem">Registar transferência entre bancos</h3>
+      <form><div class="row"><label>De<select name="from_currency">${currencyOptions('STN')}</select></label><label>Valor enviado<input name="amount" inputmode="decimal" required></label></div>
+      <div class="row"><label>Para<select name="to_currency">${currencyOptions('EUR')}</select></label><label>Valor recebido<input name="to_amount" inputmode="decimal" required></label></div>
+      <label>Referência (SWIFT/extrato)<input name="reference" maxlength="80" required></label>${pinField}
+      <button class="btn primary">Registar acerto</button></form>
+      <h3 style="font-size:1rem;margin-top:20px">Conta bancária da empresa</h3>
+      <form data-bankform><div class="row"><label>Moeda<select name="currency">${currencyOptions('EUR')}</select></label><label>Banco<input name="bank_name" placeholder="Ex.: CGD, BISTP" required></label></div>
+      <label>Titular<input name="holder" required></label><label>IBAN<input name="iban" required style="text-transform:uppercase"></label>
+      <label>SWIFT/BIC (opcional)<input name="swift" maxlength="11" style="text-transform:uppercase"></label>${pinField}
+      <button class="btn primary">Guardar conta</button></form>`,
+    setup: async (root) => {
+      const render = (v) => {
+        $('[data-view]', root).innerHTML = `<p class="hint">Em cada moeda, o banco da empresa tem de ter pelo menos o dinheiro dos clientes. "Excedente" negativo = esse banco precisa de receber dinheiro de outro banco da empresa.</p>
+          <table class="cur"><tr><th>Moeda</th><th>Banco</th><th>Clientes</th><th>Excedente</th></tr>${v.rows.map((r) =>
+            `<tr><td>${r.currency}<br><small>${esc(r.bank ? r.bank.bank_name : '—')}</small></td><td>${esc(money(r.in_bank, ''))}</td><td>${esc(money(r.owed_to_customers, ''))}</td>
+             <td style="color:${r.surplus < 0 ? 'var(--red)' : 'inherit'}">${esc(money(r.surplus, ''))}</td></tr>`).join('')}</table>
+          ${v.suggestions.length ? `<div class="quote"><strong>Sugestão de acerto</strong>${v.suggestions.map((s) =>
+            `<div><span>${esc(money(s.amount, s.from_currency))} → ${esc(money(s.to_amount, s.to_currency))}</span><span>≈ ${esc(money(s.eur, 'EUR'))}</span></div>`).join('')}</div>` : '<p class="who">Contas equilibradas: não é preciso transferir nada. ✓</p>'}`;
+      };
+      const bankForm = $('[data-bankform]', root);
+      bankForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const f = new FormData(bankForm);
+        const btn = bankForm.querySelector('button.primary');
+        btn.disabled = true;
+        try {
+          await api('POST', '/admin/bank/accounts', Object.fromEntries(f));
+          toast(`Conta bancária em ${f.get('currency')} guardada.`); bankForm.reset(); render(await api('GET', '/admin/settlement'));
+        } catch (err) { toast(err.message, true); }
+        finally { btn.disabled = false; }
+      });
+      render(await api('GET', '/admin/settlement'));
+    },
+    submit: async (f) => {
+      await api('POST', '/admin/settlement', Object.fromEntries(f));
+      done('Acerto registado.');
+    },
+  }),
+
   admin: () => ({
     title: 'Painel de administração',
     html: '<div data-stats></div><input data-search placeholder="Procurar por nome ou número"><div data-users></div>',
@@ -481,10 +735,18 @@ const SHEETS = {
       const load = async (q = '') => {
         const users = await api('GET', '/admin/users?search=' + encodeURIComponent(q));
         box.innerHTML = users.map((u) => `<div class="user-row">
-          <div><strong>${flagOf(u.country)} ${esc(u.name)}</strong><br><small>${esc(prettyPhone(u.phone))} · ${u.wallets.map((w) => esc(money(w.balance, w.currency))).join(' · ')}${u.status === 'blocked' ? ' · BLOQUEADO' : ''}</small></div>
+          <div><strong>${flagOf(u.country)} ${esc(u.name)}</strong>${u.merchant_name ? ` · 🏪 ${esc(u.merchant_name)}` : ''}<br><small>${esc(prettyPhone(u.phone))} · ${u.wallets.map((w) => esc(money(w.balance, w.currency))).join(' · ')}${u.status === 'blocked' ? ' · BLOQUEADO' : ''}</small></div>
           <select data-id="${u.id}" data-field="role">${['user', 'agent', 'admin'].map((r) => `<option value="${r}" ${u.role === r ? 'selected' : ''}>${{ user: 'Cliente', agent: 'Agente', admin: 'Admin' }[r]}</option>`).join('')}</select>
+          <button type="button" class="btn small" data-merchant="${u.id}" title="Conta de loja">${u.merchant_name ? '🏪' : '＋🏪'}</button>
           <select data-id="${u.id}" data-field="status"><option value="active" ${u.status === 'active' ? 'selected' : ''}>Ativo</option><option value="blocked" ${u.status === 'blocked' ? 'selected' : ''}>Bloquear</option></select>
         </div>`).join('') || '<p class="empty">Sem resultados.</p>';
+        box.querySelectorAll('[data-merchant]').forEach((b) => b.addEventListener('click', async () => {
+          const u = users.find((x) => String(x.id) === b.dataset.merchant);
+          const name = prompt('Nome da loja (deixe vazio para desligar a conta de loja):', u.merchant_name || '');
+          if (name === null) return;
+          try { await api('PATCH', `/admin/users/${u.id}`, { merchant_name: name }); toast(name ? 'Conta de loja ativada.' : 'Conta de loja desligada.'); load(q); }
+          catch (err) { toast(err.message, true); }
+        }));
         box.querySelectorAll('select').forEach((sel) => sel.addEventListener('change', async () => {
           try { await api('PATCH', `/admin/users/${sel.dataset.id}`, { [sel.dataset.field]: sel.value }); toast('Atualizado.'); }
           catch (err) { toast(err.message, true); load(q); }
@@ -519,6 +781,50 @@ const SHEETS = {
 
 function done(msg) { closeSheet(); toast(msg); refresh(); }
 
+const STATUS = { pending: 'Pendente', completed: 'Concluído', rejected: 'Recusado', cancelled: 'Cancelado', paid: 'Pago', expired: 'Expirado' };
+const copyRow = (label, shown, value = shown) => `<div class="copy-row"><div><small>${esc(label)}</small><strong>${esc(shown)}</strong></div>
+  <button type="button" class="btn small" data-copy="${esc(value)}">Copiar</button></div>`;
+function bindCopy(root) {
+  root.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = 'Copiado ✓'; setTimeout(() => { b.textContent = 'Copiar'; }, 1500); }
+    catch { toast('Não foi possível copiar. Selecione o texto à mão.', true); }
+  }));
+}
+
+// Mostra o QR da cobrança e espera pelo pagamento (verifica a cada 3 s).
+async function showCharge(c) {
+  $('#sheetTitle').textContent = 'Mostre ao cliente';
+  const root = $('#sheetContent');
+  root.innerHTML = `<div class="center" data-chargebox>
+    <img class="qr" data-qr alt="QR code de pagamento">
+    <p style="margin:0">ou escreva o código:</p>
+    <div class="big-code">${esc(c.code)}</div>
+    <div class="summary"><div><span>Valor</span><strong>${esc(money(c.amount, c.currency))}</strong></div>
+      ${c.description ? `<div><span>Descrição</span><span>${esc(c.description)}</span></div>` : ''}</div>
+    <p class="hint" data-wait>⏳ À espera do pagamento… (válido 15 min)</p>
+    <button type="button" class="btn danger" data-cancelcharge style="width:100%">Cancelar cobrança</button></div>`;
+  const res = await fetch(`/api/charges/${c.id}/qr.svg`, { headers: { authorization: 'Bearer ' + state.token } });
+  if (res.ok) $('[data-qr]', root).src = URL.createObjectURL(await res.blob());
+  $('[data-cancelcharge]', root).addEventListener('click', async () => {
+    try { await api('POST', `/charges/${c.id}/cancel`); done('Cobrança cancelada.'); } catch (err) { toast(err.message, true); }
+  });
+  const box = $('[data-chargebox]', root);
+  const poll = setInterval(async () => {
+    if (!box.isConnected) { clearInterval(poll); return; }
+    try {
+      const s = await api('GET', `/charges/${c.id}`);
+      if (s.status === 'pending') return;
+      clearInterval(poll);
+      box.innerHTML = s.status === 'paid'
+        ? `<div class="paid-big">✓</div><h2>Pago!</h2><p><strong>${esc(money(s.amount, s.currency))}</strong> por ${esc(s.payer ? s.payer.name : 'cliente')}</p>
+           <button type="button" class="btn primary" data-close>Concluído</button>`
+        : `<p class="who err">Cobrança ${esc(STATUS[s.status] || s.status).toLowerCase()}.</p><button type="button" class="btn primary" data-close>Fechar</button>`;
+      bindClose();
+      if (s.status === 'paid') refresh();
+    } catch { /* tenta de novo */ }
+  }, 3000);
+}
+
 function openSheet(name, arg) {
   const def = SHEETS[name](arg);
   $('#sheetTitle').textContent = def.title;
@@ -526,6 +832,7 @@ function openSheet(name, arg) {
   root.innerHTML = def.html;
   $('#sheet').hidden = false;
   bindClose();
+  root.querySelectorAll('[data-go]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.go)));
   const form = $('form', root);
   if (def.setup) Promise.resolve(def.setup(root)).catch((err) => toast(err.message, true));
   if (!form || !def.submit) return;
@@ -550,6 +857,17 @@ function openSheet(name, arg) {
   if (first) setTimeout(() => first.focus(), 50);
 }
 
+// Lê os endereços dos QR codes: ".../?pagar=CODIGO" (loja) ou ".../?enviar=+239…&valor=…" (pessoa).
+function parseLink(raw) {
+  try {
+    const url = new URL(raw.replace(/^dobrapay:pay\?to=/, 'https://x/?enviar=').replace(/&amount=/, '&valor='));
+    const p = url.searchParams;
+    if (p.get('pagar')) return { pagar: p.get('pagar') };
+    if (p.get('enviar')) return { enviar: p.get('enviar'), valor: p.get('valor') };
+  } catch { /* não é um endereço */ }
+  return null;
+}
+
 // Leitor de QR code com a câmara (Chrome/Android suportam BarcodeDetector).
 async function scanQr(form) {
   let stream;
@@ -568,11 +886,11 @@ async function scanQr(form) {
       if (!wrap.isConnected) return;
       const codes = await detector.detect(video).catch(() => []);
       const raw = codes[0] && codes[0].rawValue;
-      if (raw && raw.startsWith('dobrapay:pay?')) {
-        const p = new URLSearchParams(raw.slice('dobrapay:pay?'.length));
-        form.querySelector('[name=to]').value = p.get('to') || '';
-        if (p.get('amount')) form.querySelector('[name=amount]').value = p.get('amount').replace('.', ',');
-        form.querySelector('[name=to]').dispatchEvent(new Event('input', { bubbles: true }));
+      const link = raw && parseLink(raw);
+      if (link) {
+        const set = (name, v) => { const el = form.querySelector(`[name=${name}]`); if (el && v) { el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); } };
+        if (link.pagar) set('code', link.pagar);
+        if (link.enviar) { set('to', link.enviar); set('amount', link.valor && link.valor.replace('.', ',')); }
         stop();
         return;
       }
@@ -593,6 +911,10 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet
 document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.open)));
 
 // ---------------- Arranque ----------------
+// Nenhum formulário é enviado "à moda antiga" (isso recarregava a página e
+// punha o PIN no endereço). Os formulários são sempre tratados em JavaScript.
+document.addEventListener('submit', (e) => e.preventDefault(), true);
+
 setInterval(() => { if (!document.hidden && state.token && $('#sheet').hidden) refresh(); }, 15000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.token) refresh(); });
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
@@ -600,5 +922,11 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catc
 (async () => {
   try { CFG = await api('GET', '/config'); } catch (err) { toast(err.message, true); return; }
   setupAuthCountry();
+  const link = parseLink(location.href);
+  if (link) {
+    sessionStorage.setItem('dp_link', JSON.stringify(link));
+    history.replaceState(null, '', location.pathname); // limpa o endereço
+    if (!state.token) toast(link.pagar ? 'Entre na sua conta para pagar.' : 'Entre na sua conta para enviar.');
+  }
   if (state.token) showHome(); else $('#auth').hidden = false;
 })();
