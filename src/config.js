@@ -4,7 +4,7 @@
 const EUR = 100; // 1 euro = 100 cêntimos
 
 module.exports = {
-  APP_NAME: process.env.APP_NAME || 'Dobraplay',
+  APP_NAME: process.env.APP_NAME || 'DobraPay',
 
   // Países onde a app funciona. "pattern" valida o número nacional (sem indicativo).
   COUNTRIES: {

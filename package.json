@@ -1,5 +1,5 @@
 {
-  "name": "dobraplay",
+  "name": "dobrapay",
   "version": "0.1.0",
   "description": "Carteira móvel para São Tomé e Príncipe: enviar, receber e pedir dinheiro em Dobras (STN), com rede de agentes para depósito e levantamento.",
   "main": "server.js",
