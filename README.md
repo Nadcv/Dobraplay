@@ -1,4 +1,4 @@
-# DobraPay 🇸🇹 🇦🇴 🇨🇻 🇵🇹 🇪🇸
+# Dobraplay 🇸🇹 🇦🇴 🇨🇻 🇵🇹 🇪🇸
 
 Carteira móvel para enviar, receber e pedir dinheiro entre **São Tomé e Príncipe, Angola, Cabo Verde, Portugal e Espanha**, com **conversão automática de moeda** e uma **rede de agentes** para depositar e levantar dinheiro vivo (modelo M-Pesa / remessas).
 
@@ -65,13 +65,13 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | Variável | Para que serve |
 |---|---|
 | `PORT` | Porta (por omissão 3000) |
-| `DB_FILE` | Ficheiro da base de dados (por omissão `data/dobrapay.db`) |
+| `DB_FILE` | Ficheiro da base de dados (por omissão `data/dobraplay.db`) |
 | `ADMIN_PHONE` | Número da conta administradora |
-| `APP_NAME` | Nome da marca (por omissão DobraPay) |
+| `APP_NAME` | Nome da marca (por omissão Dobraplay) |
 
 ## Publicar
 
-`docker build -t dobrapay . && docker run -p 3000:3000 -v dobrapay-data:/data -e ADMIN_PHONE=9900000 dobrapay`
+`docker build -t dobraplay . && docker run -p 3000:3000 -v dobraplay-data:/data -e ADMIN_PHONE=9900000 dobraplay`
 
 ⚠️ Use um alojamento com **disco persistente** (Railway com volume, Fly.io, Render com disco pago, um VPS). No plano grátis do Render o disco apaga-se a cada deploy, e aqui isso seria perder o dinheiro dos clientes.
 

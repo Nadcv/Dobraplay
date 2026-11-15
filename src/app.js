@@ -124,7 +124,7 @@ function createApp(service) {
       const params = new URLSearchParams({ to: req.user.phone });
       const a = req.query.amount ? parseAmount(String(req.query.amount)) : null;
       if (a) params.set('amount', (a / 100).toFixed(2));
-      const svg = await QRCode.toString(`dobrapay:pay?${params}`, { type: 'svg', margin: 1, width: 260 });
+      const svg = await QRCode.toString(`dobraplay:pay?${params}`, { type: 'svg', margin: 1, width: 260 });
       res.type('image/svg+xml').set('Cache-Control', 'no-store').send(svg);
     } catch (e) { next(e); }
   });

@@ -1,4 +1,4 @@
-// DobraPay — app do cliente (JavaScript simples, sem frameworks).
+// Dobraplay — app do cliente (JavaScript simples, sem frameworks).
 'use strict';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -318,7 +318,7 @@ const SHEETS = {
         catch (err) { toast(err.message, true); }
       });
       const share = $('[data-share]', root);
-      if (share) share.addEventListener('click', () => navigator.share({ title: 'DobraPay', text: `Envie-me dinheiro pelo DobraPay para ${prettyPhone(state.me.phone)} (${state.me.name}).` }).catch(() => {}));
+      if (share) share.addEventListener('click', () => navigator.share({ title: 'Dobraplay', text: `Envie-me dinheiro pelo Dobraplay para ${prettyPhone(state.me.phone)} (${state.me.name}).` }).catch(() => {}));
     },
   }),
 
@@ -356,7 +356,7 @@ const SHEETS = {
   cashout: () => ({
     title: 'Levantar dinheiro',
     html: `<form>
-      <p class="hint" style="margin:0 0 14px">Gere um código e mostre-o a um agente DobraPay no país onde está. O agente entrega-lhe o dinheiro vivo.</p>
+      <p class="hint" style="margin:0 0 14px">Gere um código e mostre-o a um agente Dobraplay no país onde está. O agente entrega-lhe o dinheiro vivo.</p>
       <div class="row">${amountField('Quero levantar')}<label>Em<select name="currency">${currencyOptions(state.me.home_currency, [...new Set(Object.values(CFG.countries).map((c) => c.currency))])}</select></label></div>
       ${fromWalletField('Sai da carteira')}${quoteBox}${pinField}
       <button class="btn primary">Gerar código</button></form>`,
@@ -568,8 +568,8 @@ async function scanQr(form) {
       if (!wrap.isConnected) return;
       const codes = await detector.detect(video).catch(() => []);
       const raw = codes[0] && codes[0].rawValue;
-      if (raw && raw.startsWith('dobrapay:pay?')) {
-        const p = new URLSearchParams(raw.slice('dobrapay:pay?'.length));
+      if (raw && raw.startsWith('dobraplay:pay?')) {
+        const p = new URLSearchParams(raw.slice('dobraplay:pay?'.length));
         form.querySelector('[name=to]').value = p.get('to') || '';
         if (p.get('amount')) form.querySelector('[name=amount]').value = p.get('amount').replace('.', ',');
         form.querySelector('[name=to]').dispatchEvent(new Event('input', { bubbles: true }));
