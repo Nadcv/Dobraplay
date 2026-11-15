@@ -57,7 +57,8 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 14 testes automáticos
+npm test                            # 15 testes automáticos (SQLite)
+TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
 Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em São Tomé e clientes em vários países (ex.: 🇪🇸 612 345 678, 🇦🇴 923 456 789). No painel admin torne o agente "Agente", emita-lhe float e faça um depósito para um cliente noutro país.
@@ -65,15 +66,40 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | Variável | Para que serve |
 |---|---|
 | `PORT` | Porta (por omissão 3000) |
-| `DB_FILE` | Ficheiro da base de dados (por omissão `data/dobrapay.db`) |
+| `DATABASE_URL` | Endereço PostgreSQL. **Obrigatório em produção** (ex.: Neon grátis) |
+| `DB_FILE` | Sem `DATABASE_URL`, usa este ficheiro SQLite (por omissão `data/dobrapay.db`), só para o computador |
 | `ADMIN_PHONE` | Número da conta administradora |
 | `APP_NAME` | Nome da marca (por omissão DobraPay) |
 
-## Publicar
+## Publicar grátis (Render + Neon)
 
-`docker build -t dobrapay . && docker run -p 3000:3000 -v dobrapay-data:/data -e ADMIN_PHONE=9900000 dobrapay`
+Os servidores grátis **apagam o disco** a cada reinício. Por isso, online, a DobraPay guarda tudo numa **base de dados PostgreSQL grátis no Neon**, e o **Render** só corre a app. Nenhum dos dois pede cartão.
 
-⚠️ Use um alojamento com **disco persistente** (Railway com volume, Fly.io, Render com disco pago, um VPS). No plano grátis do Render o disco apaga-se a cada deploy, e aqui isso seria perder o dinheiro dos clientes.
+### 1. Base de dados (Neon), cerca de 3 minutos
+1. Crie conta em https://neon.tech (pode entrar com o GitHub).
+2. **Create project**: nome `dobrapay`, versão PostgreSQL 16, região **Europe (Frankfurt)**.
+3. No painel do projeto, carregue em **Connect** e copie o endereço (*connection string*). É parecido com
+   `postgresql://utilizador:senha@ep-xxxx.eu-central-1.aws.neon.tech/neondb?sslmode=require`
+
+### 2. Servidor (Render), cerca de 5 minutos
+1. Crie conta em https://render.com (pode entrar com o GitHub).
+2. **New → Blueprint** → escolha o repositório **Dobraplay**. O ficheiro `render.yaml` já configura tudo: plano grátis, Node 22, verificação de saúde em `/api/health`.
+3. Quando o Render pedir as variáveis:
+   - `DATABASE_URL`: cole o endereço do Neon do passo anterior;
+   - `ADMIN_PHONE`: o seu número com indicativo (ex.: `+2399900000`).
+4. **Apply**. Uns minutos depois a app fica em `https://dobrapay.onrender.com` (ou parecido), com HTTPS.
+5. Abra o endereço no telemóvel, **crie a conta com o número do `ADMIN_PHONE`** (fica administrador) e, no menu do navegador, escolha **"Adicionar ao ecrã principal"** para a instalar como app.
+
+Cada `git push` para `main` publica uma versão nova automaticamente. As tabelas criam-se sozinhas no primeiro arranque.
+
+### Limitações do plano grátis
+- **Adormece após 15 minutos sem visitas.** A primeira visita depois disso demora cerca de 1 minuto. Para ficar sempre acordada, use um monitor grátis como o https://uptimerobot.com a abrir `https://SEU-ENDEREÇO/api/health` a cada 10 minutos.
+- **Neon grátis: 0,5 GB**, o que chega para centenas de milhares de transações. Faça cópias de segurança regulares (o Neon guarda um histórico curto; para dinheiro real use um plano pago com cópias diárias).
+- Serve para testes e para um piloto pequeno. Para operar com dinheiro real, passe para planos pagos (com cópias de segurança e sem adormecer) e cumpra a secção seguinte.
+
+### Alternativa: Docker num servidor próprio
+`docker build -t dobrapay . && docker run -p 3000:3000 -e DATABASE_URL=postgres://... -e ADMIN_PHONE=+2399900000 dobrapay`
+(Sem `DATABASE_URL`, o contentor usa SQLite no volume `/data`: monte um volume persistente.)
 
 ## Antes de lançar com dinheiro real
 
@@ -84,7 +110,7 @@ Este código é uma base técnica sólida, mas **para operar legalmente** ainda 
 2. **KYC e combate ao branqueamento de capitais**: verificação do BI para o nível 2, listas de sanções, alertas de operações suspeitas.
 3. **Câmbios automáticos**: ligar o AOA e o USD a uma fonte oficial (BNA, BCE) em vez de os atualizar à mão.
 4. **Verificação do número por SMS** no registo e, de preferência, **USSD** (`*xxx#`) para quem não tem smartphone.
-5. **Base de dados de produção**: migrar o SQLite para PostgreSQL com cópias de segurança diárias se houver vários servidores.
+5. **Base de dados de produção**: plano pago com cópias de segurança diárias e restauro testado. A app já usa PostgreSQL com bloqueios de linha, testados com pedidos simultâneos.
 6. Auditoria de segurança externa, termos de uso e política de privacidade, apoio ao cliente e processo de reclamações e estornos.
 
 ## Estrutura
@@ -92,9 +118,10 @@ Este código é uma base técnica sólida, mas **para operar legalmente** ainda 
 ```
 server.js          arranque
 src/config.js      limites, taxas, regras
-src/db.js          esquema SQLite e transações
+src/db.js          esquema e transações (SQLite no computador, PostgreSQL online)
 src/service.js     regras de negócio (contas, transferências, agentes, admin)
 src/app.js         API HTTP + segurança (rate limit, cabeçalhos)
 public/            app PWA (instalável no telemóvel)
 tests/             testes automáticos
+render.yaml        configuração do Render (publicar grátis)
 ```
