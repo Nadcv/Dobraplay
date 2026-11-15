@@ -5,6 +5,7 @@ const QRCode = require('qrcode');
 const C = require('./config');
 const { ApiError, parseAmount } = require('./util');
 const { isCheckViolation, isUniqueViolation } = require('./db');
+const { verifyWebhook } = require('./payouts');
 
 // Limitador simples em memória. Para vários servidores, usar Redis.
 // A chave por omissão é o UTILIZADOR (ou o número de telefone no login), e não
@@ -26,11 +27,12 @@ function rateLimit({ windowMs, max, key = byUser }) {
   };
 }
 
-function createApp(service) {
+function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET } = {}) {
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '20kb' }));
+  // Guarda o corpo exato dos pedidos para verificar a assinatura dos webhooks dos parceiros.
+  app.use(express.json({ limit: '20kb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 
   app.use((req, res, next) => {
     res.set({
@@ -107,12 +109,12 @@ function createApp(service) {
   api.post('/transfers', auth, moneyLimit, wrap((req) => {
     const b = body(req);
     return service.transfer(req.user, { to: b.to, note: b.note, pin: b.pin, amount: amount(b.amount), fromCurrency: b.from_currency,
-      idempotencyKey: b.idempotency_key, expectedTo: expected(b.expected_to_amount) }, req.ip);
+      idempotencyKey: b.idempotency_key, expectedTo: expected(b.expected_to_amount), quoteId: b.quote_id }, req.ip);
   }));
   api.post('/exchange', auth, moneyLimit, wrap((req) => {
     const b = body(req);
     return service.exchange(req.user, { amount: amount(b.amount), fromCurrency: b.from_currency, toCurrency: b.to_currency, pin: b.pin,
-      idempotencyKey: b.idempotency_key, expectedTo: expected(b.expected_to_amount) }, req.ip);
+      idempotencyKey: b.idempotency_key, expectedTo: expected(b.expected_to_amount), quoteId: b.quote_id }, req.ip);
   }));
   api.get('/transactions', auth, wrap((req) => service.history(req.user, req.query)));
 
@@ -123,7 +125,7 @@ function createApp(service) {
   api.get('/requests', auth, wrap((req) => service.listRequests(req.user)));
   api.post('/requests/:id/pay', auth, moneyLimit, wrap((req) => {
     const b = body(req);
-    return service.payRequest(req.user, req.params.id, { pin: b.pin, fromCurrency: b.from_currency, idempotencyKey: b.idempotency_key }, req.ip);
+    return service.payRequest(req.user, req.params.id, { pin: b.pin, fromCurrency: b.from_currency, idempotencyKey: b.idempotency_key, quoteId: b.quote_id }, req.ip);
   }));
   api.post('/requests/:id/decline', auth, wrap((req) => service.closeRequest(req.user, req.params.id, 'decline')));
   api.post('/requests/:id/cancel', auth, wrap((req) => service.closeRequest(req.user, req.params.id, 'cancel')));
@@ -152,12 +154,18 @@ function createApp(service) {
     const b = body(req);
     return service.createBankDeposit(req.user, { amount: amount(b.amount), currency: b.currency }, req.ip);
   }));
-  api.get('/quote/bank-withdrawal', auth, wrap((req) => service.quoteBankWithdrawal(req.user, { amount: amount(req.query.amount), currency: req.query.currency })));
+  api.get('/quote/bank-withdrawal', auth, wrap((req) => service.quoteBankWithdrawal(req.user,
+    { amount: amount(req.query.amount), currency: req.query.currency, fromCurrency: req.query.from_currency })));
   api.post('/bank/withdrawals', auth, moneyLimit, wrap((req) => {
     const b = body(req);
-    return service.createBankWithdrawal(req.user, { amount: amount(b.amount), currency: b.currency, iban: b.iban, holder: b.holder,
-      pin: b.pin, idempotencyKey: b.idempotency_key }, req.ip);
+    return service.createBankWithdrawal(req.user, { amount: amount(b.amount), currency: b.currency, fromCurrency: b.from_currency,
+      iban: b.iban, holder: b.holder, beneficiaryPhone: b.beneficiary_phone, saveBeneficiary: b.save_beneficiary,
+      pin: b.pin, idempotencyKey: b.idempotency_key, quoteId: b.quote_id }, req.ip);
   }));
+  api.get('/bank/beneficiaries', auth, wrap((req) => service.listBeneficiaries(req.user)));
+  api.delete('/bank/beneficiaries/:id', auth, wrap((req) => service.deleteBeneficiary(req.user, req.params.id)));
+  api.get('/me/bank-account', auth, wrap(async (req) => ({ account: await service.getMyBankAccount(req.user) })));
+  api.post('/me/bank-account', auth, wrap(async (req) => ({ account: await service.setMyBankAccount(req.user, body(req)) })));
   api.post('/bank/requests/:id/cancel', auth, wrap((req) => service.cancelBankRequest(req.user, req.params.id, req.ip)));
 
   // ----- Pagamentos em lojas -----
@@ -175,7 +183,16 @@ function createApp(service) {
   api.get('/pay/:code', auth, lookupLimit, wrap((req) => service.getCharge(req.user, req.params.code, { fromCurrency: req.query.from_currency })));
   api.post('/pay/:code', auth, moneyLimit, wrap((req) => {
     const b = body(req);
-    return service.payCharge(req.user, req.params.code, { fromCurrency: b.from_currency, pin: b.pin, idempotencyKey: b.idempotency_key }, req.ip);
+    return service.payCharge(req.user, req.params.code, { fromCurrency: b.from_currency, pin: b.pin, idempotencyKey: b.idempotency_key, quoteId: b.quote_id }, req.ip);
+  }));
+
+  // ----- Webhooks dos parceiros de pagamento -----
+  // O parceiro confirma (ou recusa) um pagamento. Não usa sessão: tem de vir
+  // assinado (cabeçalho X-DobraPay-Signature = HMAC-SHA256 do corpo com PAYOUT_WEBHOOK_SECRET).
+  api.post('/webhooks/payouts/:provider', rateLimit({ windowMs: 60000, max: 120, key: (req) => req.ip }), wrap((req) => {
+    if (!webhookSecret) throw new ApiError(503, 'webhooks_disabled', 'Webhooks desativados: falta PAYOUT_WEBHOOK_SECRET.');
+    if (!verifyWebhook(webhookSecret, req.rawBody, req.get('x-dobrapay-signature'))) throw new ApiError(401, 'bad_signature', 'Assinatura inválida.');
+    return service.handlePayoutEvent(String(req.params.provider), body(req));
   }));
 
   // ----- Agente -----
@@ -183,7 +200,7 @@ function createApp(service) {
   api.post('/agent/cash-in', auth, moneyLimit, wrap((req) => {
     const b = body(req);
     return service.cashIn(req.user, { to: b.to, pin: b.pin, amount: amount(b.amount), idempotencyKey: b.idempotency_key,
-      expectedTo: expected(b.expected_to_amount) }, req.ip);
+      expectedTo: expected(b.expected_to_amount), quoteId: b.quote_id }, req.ip);
   }));
   api.post('/agent/cash-out', auth, moneyLimit, wrap((req) => service.redeemCashout(req.user, body(req), req.ip)));
 
@@ -218,6 +235,9 @@ function createApp(service) {
     return service.setCompanyBankAccount(req.user, { currency: b.currency, bankName: b.bank_name, holder: b.holder, iban: b.iban, swift: b.swift, pin: b.pin }, req.ip);
   }));
   api.get('/admin/settlement', auth, wrap((req) => service.settlementView(req.user)));
+  api.get('/admin/payout-providers', auth, wrap((req) => service.listPayoutProviders(req.user)));
+  api.post('/admin/payout-providers', auth, wrap((req) => service.setPayoutProvider(req.user,
+    { currency: body(req).currency, provider: body(req).provider, pin: body(req).pin }, req.ip)));
   api.post('/admin/liquidity', auth, wrap((req) => {
     const b = body(req);
     const empty = b.max_shortfall == null || String(b.max_shortfall).trim() === '';

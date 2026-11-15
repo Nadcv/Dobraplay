@@ -24,3 +24,6 @@ services:
       # O seu número, com indicativo (ex.: +2399900000): fica administrador.
       - key: ADMIN_PHONE
         sync: false
+      # Segredo para os webhooks dos parceiros de pagamento (gerado pelo Render).
+      - key: PAYOUT_WEBHOOK_SECRET
+        generateValue: true

@@ -120,3 +120,7 @@ table.cur th:first-child, table.cur td:first-child { text-align: left; }
 .tag.rejected, .tag.cancelled, .tag.expired { background: #fde8ec; color: var(--red); }
 .paid-big { font-size: 3rem; color: var(--green); text-align: center; }
 #bankBadge:not(:empty) { background: var(--red); color: #fff; border-radius: 999px; padding: 0 6px; font-size: .75rem; margin-left: 2px; }
+
+.quote .lock { color: var(--green-dark); font-size: .85rem; }
+.check { display: flex; gap: 8px; align-items: center; color: var(--text); }
+.check input { width: auto; }

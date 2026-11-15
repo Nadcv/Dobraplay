@@ -22,7 +22,7 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 4; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + pagamentos em lojas
+const SCHEMA_VERSION = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
 const SCHEMA = `
@@ -152,6 +152,12 @@ const SCHEMA = `
     holder          TEXT,
     status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','rejected','cancelled')),
     bank_reference  TEXT,                          -- referência do movimento no extrato do banco
+    from_currency   TEXT,                          -- envio para IBAN com câmbio: moeda de origem (NULL = igual a currency)
+    from_amount     INTEGER,                       -- valor que saiu da carteira (sem a taxa)
+    beneficiary_phone TEXT,                        -- envio para outra pessoa: telefone dela (opcional)
+    provider        TEXT,                          -- parceiro que faz o pagamento (NULL = manual)
+    external_id     TEXT,                          -- identificador da ordem no parceiro
+    provider_status TEXT,                          -- submitted / paid / failed
     note            TEXT,
     tx_id           TEXT REFERENCES transactions(id),
     final_tx_id     TEXT REFERENCES transactions(id),
@@ -160,6 +166,49 @@ const SCHEMA = `
     updated_at      INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS bank_req_status ON bank_requests(status, kind);
+
+  -- Como são pagos os levantamentos de cada moeda: 'manual' (o admin faz a
+  -- transferência) ou um parceiro por API ('sandbox' = simulador de testes).
+  CREATE TABLE IF NOT EXISTS payout_providers (
+    currency    TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    updated_by  INTEGER
+  );
+
+  -- Cotações com câmbio garantido durante alguns segundos (usadas uma só vez).
+  CREATE TABLE IF NOT EXISTS quotes (
+    id          TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    kind        TEXT NOT NULL,                    -- transfer, exchange, cash_in, request, charge, payout
+    qkey        TEXT NOT NULL,                    -- o que foi cotado (destinatário, moedas, valor…)
+    data        TEXT NOT NULL,                    -- valores da cotação (JSON)
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    created_at  INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS quotes_expires ON quotes(expires_at);
+
+  -- Beneficiários bancários de cada cliente (privados: só quem os guardou os vê).
+  CREATE TABLE IF NOT EXISTS beneficiaries (
+    id          INTEGER PRIMARY KEY,
+    owner_id    INTEGER NOT NULL REFERENCES users(id),
+    name        TEXT NOT NULL,
+    iban        TEXT NOT NULL,
+    currency    TEXT NOT NULL,
+    phone       TEXT,
+    created_at  INTEGER NOT NULL,
+    last_used   INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS beneficiaries_owner_iban ON beneficiaries(owner_id, iban);
+
+  -- IBAN do próprio cliente (para levantar sem o escrever de cada vez).
+  CREATE TABLE IF NOT EXISTS user_bank_accounts (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id),
+    iban        TEXT NOT NULL,
+    holder      TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+  );
 
   -- Cobranças de lojas: a loja gera um QR, o cliente paga.
   CREATE TABLE IF NOT EXISTS charges (
@@ -319,6 +368,24 @@ const MIGRATIONS = {
     // SQLite só é usado no computador (dados de teste), pede-se para apagar.
     sqlite: null,
   },
+  5: {
+    postgres: `
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS from_currency TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS from_amount BIGINT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS beneficiary_phone TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS provider TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS external_id TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS provider_status TEXT;
+    `,
+    sqlite: `
+      ALTER TABLE bank_requests ADD COLUMN from_currency TEXT;
+      ALTER TABLE bank_requests ADD COLUMN from_amount INTEGER;
+      ALTER TABLE bank_requests ADD COLUMN beneficiary_phone TEXT;
+      ALTER TABLE bank_requests ADD COLUMN provider TEXT;
+      ALTER TABLE bank_requests ADD COLUMN external_id TEXT;
+      ALTER TABLE bank_requests ADD COLUMN provider_status TEXT;
+    `,
+  },
 };
 
 async function openDb({ url, file } = {}) {
@@ -352,6 +419,8 @@ async function openDb({ url, file } = {}) {
         console.log(`Base de dados atualizada para a versão ${v}.`);
       }
     }
+    // Índices que dependem de colunas acrescentadas por atualizações (depois de as aplicar).
+    await db.execRaw('CREATE INDEX IF NOT EXISTS bank_req_external ON bank_requests(provider, external_id)');
     await db.run('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value', 'version', String(SCHEMA_VERSION));
     // Contas internas da empresa e câmbio inicial (uma única vez por moeda).
     for (const [cur, info] of Object.entries(CURRENCIES)) {

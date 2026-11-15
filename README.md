@@ -24,7 +24,7 @@ Antes de cada confirmação, a app mostra **quanto paga, a taxa, o câmbio e qua
 
 | Para quem | Funcionalidades |
 |---|---|
-| **Cliente** | Conta com número de qualquer dos 5 países e PIN · várias carteiras (STN, AOA, CVE, EUR, USD) · **enviar** para qualquer país (nome do destinatário visível antes de confirmar) · **receber** com QR code e escolher a moeda · **pedir** dinheiro · **câmbio** entre carteiras · **pagar em lojas** com QR ou código · **carregar e levantar por transferência bancária** (IBAN) · **levantar** num agente com código de 6 dígitos · histórico · mudar PIN |
+| **Cliente** | Conta com número de qualquer dos 5 países e PIN · várias carteiras (STN, AOA, CVE, EUR, USD) · **enviar** para qualquer país (nome do destinatário visível antes de confirmar) · **receber** com QR code e escolher a moeda · **pedir** dinheiro · **câmbio** entre carteiras · **pagar em lojas** com QR ou código · **carregar e levantar por transferência bancária** (IBAN) · **enviar para o IBAN de quem não tem DobraPay** (beneficiários guardados) · **câmbio garantido 60 s** · **levantar** num agente com código de 6 dígitos · histórico · mudar PIN |
 | **Loja** | Conta de loja (ativada pelo admin) · **cobrar com QR code** ou código de 6 letras · o cliente paga com qualquer moeda e a loja recebe o valor exato · histórico de cobranças |
 | **Agente** | **Depósito** para qualquer pessoa em qualquer país (o cliente paga em dinheiro vivo na moeda do agente) · **levantamento** com código |
 | **Administrador** | Estatísticas por moeda · gerir utilizadores (agente, admin, bloquear) · **emitir float** na moeda do agente · **atualizar câmbios** (AOA e USD; STN e CVE têm paridade fixa com o euro) · **contas bancárias da empresa** · **confirmar carregamentos e pagar levantamentos bancários** · **acerto entre bancos** (ex.: CGD ⇄ BISTP) · ativar contas de loja · verificação automática do livro-razão |
@@ -68,6 +68,26 @@ Se um envio **com câmbio** ultrapassar o limite, a app avisa o cliente **antes*
 
 Como cobrir a falta sem pausar envios: agentes que compram float (trazem dinheiro para o banco local), uma reserva inicial da empresa, ou uma linha de crédito do banco parceiro. **Nunca** com o dinheiro de outros clientes.
 
+## Câmbio garantido (60 segundos)
+
+Cada cotação mostrada ao cliente (enviar, câmbio, pagar numa loja, pedidos, depósitos de agentes, envios para IBAN) fica **garantida durante 60 segundos**, com uma contagem decrescente no ecrã. Se o cliente confirmar a tempo, paga exatamente o que viu, mesmo que o admin mude o câmbio entretanto. Depois disso, a app mostra uma cotação nova. Cada cotação só pode ser usada uma vez.
+
+## Enviar para quem não tem DobraPay (IBAN)
+
+Ao escrever um número que ainda não tem conta, a app oferece **"Enviar para a conta bancária desta pessoa"**. O cliente indica o titular e o IBAN, escolhe a moeda em que o dinheiro chega (ex.: paga em EUR e chega em STN a uma conta no BISTP) e vê a cotação garantida. Os beneficiários ficam guardados, **visíveis só para quem os guardou**. Cada cliente pode também guardar o seu próprio IBAN no perfil, para levantar sem o escrever de cada vez.
+
+## Parceiros de pagamento (pagamentos automáticos)
+
+Em **Acertos → Pagamentos automáticos**, cada moeda escolhe quem paga os levantamentos e envios para IBAN:
+
+| Opção | O que faz |
+|---|---|
+| **Manual** | O admin faz a transferência no banco e marca como paga (ecrã Banco). |
+| **Simulador** | Para testes: "paga" sozinho alguns segundos depois. Se o titular tiver a palavra `FALHA`, simula uma recusa e devolve o dinheiro. |
+| **Parceiro por API** | Aparece quando `PAYOUT_HTTP_URL` está definido. A DobraPay envia a ordem por `POST` (com `Authorization: Bearer PAYOUT_HTTP_TOKEN` e `Idempotency-Key` = referência, para nunca pagar duas vezes). O parceiro confirma depois em `POST /api/webhooks/payouts/http` com `{ "external_id", "status": "paid" \| "failed", "bank_reference", "reason" }`, assinado no cabeçalho `X-DobraPay-Signature` (HMAC-SHA256 do corpo com `PAYOUT_WEBHOOK_SECRET`). |
+
+Se o parceiro estiver em baixo, o pedido fica para **pagamento manual**, sem perder dinheiro. Se o banco recusar, o cliente recebe tudo de volta (valor + taxa) ao mesmo câmbio. Para ligar um parceiro com outro formato de API (banco, Routefusion, MoneyGram…), basta acrescentar um ficheiro com `send()` em `src/payouts.js`.
+
 ## Pagamentos em lojas
 
 O admin ativa a conta de loja de um cliente (**Painel → 🏪**). A loja carrega em **Cobrar**, escreve o valor e mostra o **QR code** ou o **código de 6 letras**. O cliente:
@@ -85,7 +105,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 23 testes automáticos (SQLite)
+npm test                            # 26 testes automáticos (SQLite)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
@@ -98,6 +118,9 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | `DB_FILE` | Sem `DATABASE_URL`, usa este ficheiro SQLite (por omissão `data/dobrapay.db`), só para o computador |
 | `ADMIN_PHONE` | Número da conta administradora |
 | `APP_NAME` | Nome da marca (por omissão DobraPay) |
+| `PAYOUT_HTTP_URL` / `PAYOUT_HTTP_TOKEN` | Endereço e chave do parceiro de pagamentos por API (opcional) |
+| `PAYOUT_WEBHOOK_SECRET` | Segredo partilhado com o parceiro para assinar os webhooks (obrigatório para receber confirmações) |
+| `PAYOUT_SANDBOX_DELAY_MS` | Quanto tempo o simulador demora a "pagar" (por omissão 5000 ms) |
 | `PUBLIC_URL` | Endereço público usado nos QR codes (opcional: por omissão usa o endereço por onde a app foi aberta) |
 
 ## Publicar grátis (Render + Neon)
@@ -149,7 +172,8 @@ server.js          arranque
 src/config.js      limites, taxas, regras
 src/db.js          esquema e transações (SQLite no computador, PostgreSQL online)
 src/service.js     regras de negócio (contas, transferências, agentes, admin)
-src/app.js         API HTTP + segurança (rate limit, cabeçalhos)
+src/app.js         API HTTP + segurança (rate limit, cabeçalhos, webhooks assinados)
+src/payouts.js     parceiros de pagamento (manual, simulador, API)
 public/            app PWA (instalável no telemóvel)
 tests/             testes automáticos
 render.yaml        configuração do Render (publicar grátis)

@@ -85,10 +85,27 @@ function renderQuote(box, q, { getLabel = 'Recebe', payLabel = 'Paga' } = {}) {
   if (q.currency !== q.to_currency) rows.push(`<div><span>Câmbio</span><span>1 ${q.currency} = ${q.rate.toLocaleString('pt-PT', { maximumSignificantDigits: 6 })} ${q.to_currency}</span></div>`);
   rows.push(`<div class="get"><span>${getLabel}</span><span>${esc(money(q.to_amount, q.to_currency))}</span></div>`);
   if (q.paused) rows.push(`<div style="color:var(--red);font-weight:600">⚠️ ${esc(q.paused.message)}</div>`);
+  else if (q.quote_id && q.currency !== q.to_currency) rows.push('<div class="lock"><span>🔒 Câmbio garantido</span><span data-countdown></span></div>');
   box.className = q.paused ? 'quote err' : 'quote';
   box.innerHTML = rows.join('');
   box.hidden = false;
 }
+
+// Mostra quantos segundos faltam no câmbio garantido; quando acaba, pede outra cotação.
+function startCountdown(form, box, q, renew) {
+  clearInterval(form._countdown);
+  const el = $('[data-countdown]', box);
+  if (!el || !q.expires_at) return;
+  const tick = () => {
+    if (!form.isConnected) { clearInterval(form._countdown); return; }
+    const left = Math.round((q.expires_at - Date.now()) / 1000);
+    if (left <= 0) { clearInterval(form._countdown); el.textContent = 'a atualizar…'; renew(); return; }
+    el.textContent = `${left} s`;
+  };
+  tick();
+  form._countdown = setInterval(tick, 1000);
+}
+const quoteOf = (form) => form.dataset.quoteId || undefined;
 
 // Pede a cotação ao servidor sempre que o formulário muda.
 function attachQuote(form, fetcher, opts) {
@@ -96,11 +113,14 @@ function attachQuote(form, fetcher, opts) {
   const update = debounce(async () => {
     const f = new FormData(form);
     form.dataset.expected = '';
+    form.dataset.quoteId = '';
     if (!f.get('amount')) { box.hidden = true; return; }
     try {
       const q = await fetcher(f);
       if (!q) { box.hidden = true; return; }
       renderQuote(box, q, opts);
+      form.dataset.quoteId = q.quote_id || '';
+      startCountdown(form, box, q, update);
       form.dataset.expected = q.to_amount;
       form.dataset.total = q.total;
       form.dataset.currency = q.currency;
@@ -125,7 +145,16 @@ function attachLookup(form, field) {
       const u = await api('GET', '/lookup?phone=' + encodeURIComponent(fullPhone(form, field)));
       who.className = 'who';
       who.textContent = `✓ ${flagOf(u.country)} ${u.name}${u.role === 'agent' ? ' (agente)' : ''} · recebe em ${u.receive_currency}`;
-    } catch (err) { who.className = 'who err'; who.textContent = err.message; }
+    } catch (err) {
+      who.className = 'who err'; who.textContent = err.message;
+      // Ainda não tem DobraPay: oferece enviar para a conta bancária da pessoa.
+      if (err.code === 'not_found' && field === 'to') {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'btn small'; b.style.marginTop = '8px'; b.textContent = '🏦 Enviar para a conta bancária desta pessoa';
+        b.addEventListener('click', () => openSheet('sendBank', { phone: fullPhone(form, field) }));
+        who.append(document.createElement('br'), b);
+      }
+    }
     who.hidden = false;
   }, 250);
   form.querySelector(`[name=${field}]`).addEventListener('input', check);
@@ -231,7 +260,7 @@ $('#balance').addEventListener('click', () => {
 });
 
 const TX_LABEL = { p2p: 'Transferência', request: 'Pedido pago', cash_in: 'Depósito', cash_out: 'Levantamento', issue: 'Float emitido', exchange: 'Câmbio',
-  bank_in: 'Carregamento por banco', bank_out: 'Levantamento para o banco', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
+  bank_in: 'Carregamento por banco', bank_out: 'Para conta bancária', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
 const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄', bank_in: '🏦', bank_out: '🏦', merchant: '🛒', refund: '↩', settlement: '🏦' };
 
 function renderHistory(txs) {
@@ -244,7 +273,8 @@ function renderHistory(txs) {
       amt = `+${esc(money(t.to_amount, t.to_currency))}<br><small>-${esc(money(t.amount + t.fee, t.currency))}</small>`;
       cls = 'in';
     } else if (t.direction === 'out') {
-      title = `${flagOf(t.to.country)} ${t.to.name}`;
+      const toPerson = t.type === 'bank_out' && /^Envio para (.+?) · /.exec(t.note || '');
+      title = toPerson ? toPerson[1] : `${flagOf(t.to.country)} ${t.to.name}`;
       amt = esc(`-${money(t.amount + t.fee, t.currency)}`);
     } else {
       title = t.type === 'bank_in' ? 'Transferência bancária' : `${flagOf(t.from.country)} ${t.from.name}`;
@@ -295,6 +325,7 @@ const SHEETS = {
   send: (pre = {}) => ({
     title: 'Enviar dinheiro',
     html: `<form>
+      <button type="button" class="choice" data-go="sendBank" style="padding:10px 14px"><span>🏦</span><div><strong>Para uma conta bancária (IBAN)</strong><small>Para quem ainda não tem DobraPay</small></div></button>
       ${phoneField('to', 'Para (número)', pre.to)}
       ${'BarcodeDetector' in window ? '<button type="button" class="btn small" data-scan style="margin:-6px 0 14px">📷 Ler QR code</button>' : ''}
       ${fromWalletField('Enviar da carteira')}
@@ -309,7 +340,7 @@ const SHEETS = {
       : null),
     submit: async (f, key, form) => {
       const r = await api('POST', '/transfers', { to: fullPhone(form, 'to'), amount: f.get('amount'), from_currency: f.get('from_currency'),
-        note: f.get('note'), pin: f.get('pin'), idempotency_key: key, expected_to_amount: expectedOf(form) });
+        note: f.get('note'), pin: f.get('pin'), idempotency_key: key, expected_to_amount: expectedOf(form), quote_id: quoteOf(form) });
       done(`Enviado! ${r.transaction.to.name} recebeu ${money(r.transaction.to_amount, r.transaction.to_currency)}.`);
     },
   }),
@@ -368,8 +399,8 @@ const SHEETS = {
       ${fromWalletField()}${quoteBox}${pinField}<button class="btn primary">Pagar</button></form>`,
     quote: (f) => api('GET', `/requests/${r.id}/quote?` + qs({ from_currency: f.get('from_currency') })),
     quoteOpts: { getLabel: 'Ela/ele recebe' },
-    submit: async (f, key) => {
-      await api('POST', `/requests/${r.id}/pay`, { pin: f.get('pin'), from_currency: f.get('from_currency'), idempotency_key: key });
+    submit: async (f, key, form) => {
+      await api('POST', `/requests/${r.id}/pay`, { pin: f.get('pin'), from_currency: f.get('from_currency'), idempotency_key: key, quote_id: quoteOf(form) });
       done('Pedido pago.');
     },
   }),
@@ -411,7 +442,7 @@ const SHEETS = {
       quoteOpts: { payLabel: 'Troca', getLabel: 'Fica com' },
       submit: async (f, key, form) => {
         const r = await api('POST', '/exchange', { amount: f.get('amount'), from_currency: f.get('from_currency'), to_currency: f.get('to_currency'),
-          pin: f.get('pin'), idempotency_key: key, expected_to_amount: expectedOf(form) });
+          pin: f.get('pin'), idempotency_key: key, expected_to_amount: expectedOf(form), quote_id: quoteOf(form) });
         done(`Trocado: +${money(r.transaction.to_amount, r.transaction.to_currency)}.`);
       },
     };
@@ -428,7 +459,7 @@ const SHEETS = {
     quoteOpts: { payLabel: 'Depósito', getLabel: 'Chega' },
     submit: async (f, key, form) => {
       const r = await api('POST', '/agent/cash-in', { to: fullPhone(form, 'to'), amount: f.get('amount'), pin: f.get('pin'),
-        idempotency_key: key, expected_to_amount: expectedOf(form) });
+        idempotency_key: key, expected_to_amount: expectedOf(form), quote_id: quoteOf(form) });
       const t = r.transaction;
       done(`Feito. Cobre ao cliente ${money(t.amount + t.fee, t.currency)}. ${t.to.name} recebeu ${money(t.to_amount, t.to_currency)}.`);
     },
@@ -534,12 +565,15 @@ const SHEETS = {
       </div>
       <p class="hint">⚠️ Escreva a referência <strong>${esc(r.reference)}</strong> no descritivo da transferência, senão não conseguimos saber que é sua. A conta tem de estar no seu nome.</p>`
     : `<div class="summary"><div><span>Valor</span><strong>${esc(money(r.amount, r.currency))}</strong></div>
-        ${r.fee ? `<div><span>Taxa</span><span>${esc(money(r.fee, r.currency))}</span></div>` : ''}
+        ${r.fee ? `<div><span>Taxa</span><span>${esc(money(r.fee, r.from_currency || r.currency))}</span></div>` : ''}
+        ${r.from_currency !== r.currency ? `<div><span>Pago com</span><span>${esc(money(r.from_amount, r.from_currency))}</span></div>` : ''}
+        ${r.holder && r.kind === 'withdrawal' ? `<div><span>Titular</span><span>${esc(r.holder)}</span></div>` : ''}
         ${r.iban ? `<div><span>Para</span><span>${esc(r.iban)}</span></div>` : ''}
+        ${r.provider_status === 'submitted' && r.status === 'pending' ? '<div><span>Banco</span><span>Enviado, à espera de confirmação</span></div>' : ''}
         <div><span>Referência</span><span>${esc(r.reference)}</span></div>
         <div><span>Estado</span><span class="tag ${r.status}">${esc(STATUS[r.status] || r.status)}</span></div>
         ${r.note ? `<div><span>Motivo</span><span>${esc(r.note)}</span></div>` : ''}</div>`}
-      ${r.status === 'pending' ? '<button type="button" class="btn danger" data-cancel style="width:100%;margin-bottom:10px">Cancelar pedido</button>' : ''}
+      ${r.status === 'pending' && r.provider_status !== 'submitted' ? '<button type="button" class="btn danger" data-cancel style="width:100%;margin-bottom:10px">Cancelar pedido</button>' : ''}
       <button type="button" class="btn primary" data-close>Fechar</button>`,
     setup: (root) => {
       bindCopy(root);
@@ -558,21 +592,68 @@ const SHEETS = {
       ${amountField('Valor a receber no banco')}${quoteBox}
       <label>IBAN da sua conta<input name="iban" autocomplete="off" placeholder="PT50 0000 0000 0000 0000 0000 0" required style="text-transform:uppercase"></label>
       <label>Titular da conta<input name="holder" maxlength="80" value="${esc(state.me.name)}"></label>
+      <label class="check"><input type="checkbox" name="remember" checked> Guardar este IBAN no meu perfil</label>
       ${pinField}<button class="btn primary">Pedir transferência</button></form>`,
     setup: async (root) => {
-      const banks = (await api('GET', '/bank/accounts')).map((b) => b.currency);
-      const mine = state.me.wallets.filter((w) => banks.includes(w.currency));
-      if (!mine.length) { $('[data-banks]', root).innerHTML = '<p class="who err">Ainda não é possível levantar para o banco nas suas moedas. Use um agente.</p>'; return; }
-      $('[name=currency]', root).innerHTML = mine.map((w) => `<option value="${w.currency}">${w.currency} · saldo ${esc(money(w.balance, w.currency))}</option>`).join('');
+      const [banks, mine] = await Promise.all([api('GET', '/bank/accounts'), api('GET', '/me/bank-account')]);
+      const curs = banks.map((b) => b.currency);
+      const wallets = state.me.wallets.filter((w) => curs.includes(w.currency));
+      if (!wallets.length) { $('[data-banks]', root).innerHTML = '<p class="who err">Ainda não é possível levantar para o banco nas suas moedas. Use um agente.</p>'; return; }
+      $('[name=currency]', root).innerHTML = wallets.map((w) => `<option value="${w.currency}">${w.currency} · saldo ${esc(money(w.balance, w.currency))}</option>`).join('');
+      if (mine.account) { $('[name=iban]', root).value = mine.account.iban; $('[name=holder]', root).value = mine.account.holder; }
+      $('form', root).dispatchEvent(new Event('change'));
     },
     quote: (f) => (f.get('currency') ? api('GET', '/quote/bank-withdrawal?' + qs({ amount: f.get('amount'), currency: f.get('currency') })) : null),
     quoteOpts: { payLabel: 'Valor', getLabel: 'Recebe no banco' },
-    submit: async (f, key) => {
+    submit: async (f, key, form) => {
       const r = await api('POST', '/bank/withdrawals', { amount: f.get('amount'), currency: f.get('currency'), iban: f.get('iban'),
-        holder: f.get('holder'), pin: f.get('pin'), idempotency_key: key });
+        holder: f.get('holder'), pin: f.get('pin'), idempotency_key: key, quote_id: quoteOf(form) });
+      if (f.get('remember')) api('POST', '/me/bank-account', { iban: f.get('iban'), holder: f.get('holder') }).catch(() => {});
       refresh();
       openSheet('bankRequest', r.request);
       toast('Pedido registado. O dinheiro já saiu da carteira e vai ser transferido para o seu banco.');
+    },
+  }),
+
+  // ---------- Enviar para o IBAN de quem não tem DobraPay ----------
+  sendBank: (pre = {}) => ({
+    title: 'Enviar para uma conta bancária',
+    html: `<form>
+      <p class="hint" style="margin:0 0 12px">Para quem ainda não tem DobraPay: o dinheiro chega à conta bancária da pessoa (ex.: BISTP em São Tomé, qualquer banco em Portugal/Espanha).</p>
+      <div data-bens></div>
+      <label>Nome do titular da conta<input name="holder" maxlength="80" required value="${esc(pre.holder || '')}"></label>
+      <label>IBAN<input name="iban" autocomplete="off" required style="text-transform:uppercase" placeholder="ST00 0000 0000 0000 0000 0000 0" value="${esc(pre.iban || '')}"></label>
+      <label>Telemóvel da pessoa (opcional)<input name="beneficiary_phone" inputmode="tel" value="${esc(pre.phone || '')}" placeholder="+239 991 2345"></label>
+      <div class="row"><label>Chega em<select name="currency"></select></label>${amountField('Valor a chegar')}</div>
+      ${fromWalletField('Pagar com')}${quoteBox}${pinField}
+      <button class="btn primary">Enviar</button></form>`,
+    setup: async (root) => {
+      const form = $('form', root);
+      const [banks, bens] = await Promise.all([api('GET', '/bank/accounts'), api('GET', '/bank/beneficiaries')]);
+      if (!banks.length) { $('[data-bens]', root).innerHTML = '<p class="who err">Ainda não é possível enviar para contas bancárias.</p>'; return; }
+      const curs = banks.map((b) => b.currency);
+      form.currency.innerHTML = currencyOptions(pre.currency && curs.includes(pre.currency) ? pre.currency : (curs.includes('STN') ? 'STN' : curs[0]), curs);
+      if (bens.length) {
+        $('[data-bens]', root).innerHTML = `<label>Beneficiários guardados<select data-ben><option value="">— novo beneficiário —</option>${bens.map((b) =>
+          `<option value="${b.id}">${esc(b.name)} · ${esc(b.iban.slice(0, 4))} … ${esc(b.iban.slice(-4))} (${esc(b.currency)})</option>`).join('')}</select></label>`;
+        $('[data-ben]', root).addEventListener('change', (e) => {
+          const b = bens.find((x) => String(x.id) === e.target.value);
+          form.holder.value = b ? b.name : ''; form.iban.value = b ? b.iban : ''; form.beneficiary_phone.value = b && b.phone ? b.phone : '';
+          if (b && curs.includes(b.currency)) form.currency.value = b.currency;
+          form.dispatchEvent(new Event('change'));
+        });
+      }
+      form.dispatchEvent(new Event('change'));
+    },
+    quote: (f) => (f.get('currency') ? api('GET', '/quote/bank-withdrawal?' + qs({ amount: f.get('amount'), currency: f.get('currency'), from_currency: f.get('from_currency') })) : null),
+    quoteOpts: { payLabel: 'Paga', getLabel: 'Chega à conta' },
+    submit: async (f, key, form) => {
+      const r = await api('POST', '/bank/withdrawals', { amount: f.get('amount'), currency: f.get('currency'), from_currency: f.get('from_currency'),
+        iban: f.get('iban'), holder: f.get('holder'), beneficiary_phone: f.get('beneficiary_phone') || undefined,
+        pin: f.get('pin'), idempotency_key: key, quote_id: quoteOf(form) });
+      refresh();
+      openSheet('bankRequest', r.request);
+      toast(`Enviado para ${f.get('holder')}. Avisamos quando o banco confirmar.`);
     },
   }),
 
@@ -609,7 +690,7 @@ const SHEETS = {
     quoteOpts: { payLabel: 'Paga', getLabel: 'A loja recebe' },
     submit: async (f, key, form) => {
       if (!form.dataset.charge) throw new Error('Escreva o código de 6 letras e números da loja.');
-      const r = await api('POST', `/pay/${form.dataset.charge}`, { from_currency: f.get('from_currency'), pin: f.get('pin'), idempotency_key: key });
+      const r = await api('POST', `/pay/${form.dataset.charge}`, { from_currency: f.get('from_currency'), pin: f.get('pin'), idempotency_key: key, quote_id: quoteOf(form) });
       done(`Pago ✓ ${money(r.transaction.to_amount, r.transaction.to_currency)} a ${r.transaction.to.name}.`);
     },
   }),
@@ -655,7 +736,9 @@ const SHEETS = {
           ${r.kind === 'deposit'
             ? `<p class="hint" style="margin:6px 0">Confirme no extrato do banco (${esc(r.pay_to ? r.pay_to.bank_name : r.currency)}) uma transferência com a referência <strong>${esc(r.reference)}</strong>.</p>
                <div class="row"><input data-amount inputmode="decimal" placeholder="Valor recebido" value="${(r.amount / 100).toFixed(2).replace('.', ',')}"><input data-ref placeholder="Ref. do extrato"></div>`
-            : `<p class="hint" style="margin:6px 0">Transferir <strong>${esc(money(r.amount, r.currency))}</strong> para <strong>${esc(r.iban)}</strong> (${esc(r.holder)}) com o descritivo ${esc(r.reference)}.</p>
+            : `<p class="hint" style="margin:6px 0">${r.third_party ? `Envio de ${esc(r.user.name)} para <strong>${esc(r.holder)}</strong>. ` : ''}Transferir <strong>${esc(money(r.amount, r.currency))}</strong> para <strong>${esc(r.iban)}</strong> (${esc(r.holder)}) com o descritivo ${esc(r.reference)}.</p>
+               ${r.provider_status === 'submitted' ? `<p class="who" style="margin:0 0 8px">⏳ Enviado ao parceiro (${esc(r.provider)}), à espera da confirmação automática.</p>` : ''}
+               ${r.provider_status === 'error' ? `<p class="who err" style="margin:0 0 8px">${esc(r.note || 'Falha no parceiro')}</p>` : ''}
                <input data-ref placeholder="Referência da transferência feita">`}
           <div class="row"><button type="button" class="btn small primary" data-ok>${r.kind === 'deposit' ? 'Confirmar recebido' : 'Marcar como pago'}</button>
             <button type="button" class="btn small danger" data-no>Recusar</button></div></div>`).join('') || '<p class="empty">Não há pedidos pendentes. ✓</p>';
@@ -684,12 +767,17 @@ const SHEETS = {
       <div class="row"><label>Para<select name="to_currency">${currencyOptions('EUR')}</select></label><label>Valor recebido<input name="to_amount" inputmode="decimal" required></label></div>
       <label>Referência (SWIFT/extrato)<input name="reference" maxlength="80" required></label>${pinField}
       <button class="btn primary">Registar acerto</button></form>
+      <h3 style="font-size:1rem;margin-top:20px">Pagamentos automáticos</h3>
+      <form data-provform data-own><p class="hint" style="margin-top:0">Quem paga os levantamentos e envios para IBAN em cada moeda: o admin à mão, ou um parceiro por API (confirma sozinho por webhook). "Simulador" serve para testar sem dinheiro real.</p>
+      <div data-provs></div>
+      <div class="row"><label>Moeda<select name="currency">${currencyOptions('STN')}</select></label><label>Quem paga<select name="provider"></select></label></div>
+      ${pinField}<button class="btn primary">Guardar</button></form>
       <h3 style="font-size:1rem;margin-top:20px">Limite de liquidez</h3>
-      <form data-limitform><p class="hint" style="margin-top:0">Quanto o banco de cada moeda pode ficar a dever aos clientes até ao próximo acerto. Se um envio com câmbio passar o limite, fica pausado com uma mensagem ao cliente. Vazio = sem limite; 0 = só com dinheiro já no banco.</p>
+      <form data-limitform data-own><p class="hint" style="margin-top:0">Quanto o banco de cada moeda pode ficar a dever aos clientes até ao próximo acerto. Se um envio com câmbio passar o limite, fica pausado com uma mensagem ao cliente. Vazio = sem limite; 0 = só com dinheiro já no banco.</p>
       <div class="row"><label>Moeda<select name="currency">${currencyOptions('STN')}</select></label><label>Falta máxima<input name="max_shortfall" inputmode="decimal" placeholder="sem limite"></label></div>
       ${pinField}<button class="btn primary">Guardar limite</button></form>
       <h3 style="font-size:1rem;margin-top:20px">Conta bancária da empresa</h3>
-      <form data-bankform><div class="row"><label>Moeda<select name="currency">${currencyOptions('EUR')}</select></label><label>Banco<input name="bank_name" placeholder="Ex.: CGD, BISTP" required></label></div>
+      <form data-bankform data-own><div class="row"><label>Moeda<select name="currency">${currencyOptions('EUR')}</select></label><label>Banco<input name="bank_name" placeholder="Ex.: CGD, BISTP" required></label></div>
       <label>Titular<input name="holder" required></label><label>IBAN<input name="iban" required style="text-transform:uppercase"></label>
       <label>SWIFT/BIC (opcional)<input name="swift" maxlength="11" style="text-transform:uppercase"></label>${pinField}
       <button class="btn primary">Guardar conta</button></form>`,
@@ -715,6 +803,19 @@ const SHEETS = {
         } catch (err) { toast(err.message, true); }
         finally { btn.disabled = false; }
       });
+      const provForm = $('[data-provform]', root);
+      const renderProv = (p) => {
+        $('[data-provs]', root).innerHTML = `<div class="summary">${p.currencies.filter((c) => c.provider !== 'manual' || ['EUR', 'STN'].includes(c.currency)).map((c) =>
+          `<div><span>${c.currency}</span><span>${esc((p.available.find((a) => a.id === c.provider) || {}).label || c.provider)}</span></div>`).join('')}</div>`;
+        provForm.provider.innerHTML = p.available.map((a) => `<option value="${a.id}">${esc(a.label)}</option>`).join('');
+      };
+      provForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const f = new FormData(provForm);
+        try { renderProv(await api('POST', '/admin/payout-providers', Object.fromEntries(f))); toast(`Pagamentos em ${f.get('currency')} atualizados.`); provForm.pin.value = ''; }
+        catch (err) { toast(err.message, true); }
+      });
+      api('GET', '/admin/payout-providers').then(renderProv).catch((err) => toast(err.message, true));
       const limitForm = $('[data-limitform]', root);
       limitForm.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -779,15 +880,29 @@ const SHEETS = {
       <div><span>Número</span><span>${flagOf(state.me.country)} ${esc(prettyPhone(state.me.phone))}</span></div>
       <div><span>Recebe em</span><span>${esc(state.me.receive_currency)}</span></div>
       <div><span>Conta</span><span>${{ user: 'Cliente', agent: 'Agente', admin: 'Administrador' }[state.me.role]} · nível ${state.me.tier}</span></div></div>
+      <form data-myiban data-own><h3 style="font-size:1rem">O meu IBAN (para levantar)</h3>
+      <label>IBAN<input name="iban" autocomplete="off" style="text-transform:uppercase" placeholder="PT50 0000 0000 0000 0000 0000 0"></label>
+      <label>Titular<input name="holder" maxlength="80" value="${esc(state.me.name)}"></label>
+      <button class="btn" style="width:100%;margin-bottom:16px">Guardar IBAN</button></form>
       <form><h3 style="font-size:1rem">Mudar PIN</h3>
       <label>PIN atual<input name="pin" type="password" inputmode="numeric" maxlength="6" required></label>
       <label>Novo PIN<input name="newPin" type="password" inputmode="numeric" maxlength="6" required></label>
       <button class="btn primary">Guardar novo PIN</button></form>
       <button type="button" class="btn danger" data-logout style="width:100%;margin-top:12px">Terminar sessão</button>`,
-    setup: (root) => $('[data-logout]', root).addEventListener('click', async () => {
-      try { await api('POST', '/auth/logout'); } catch { /* sai na mesma */ }
-      logoutLocal();
-    }),
+    setup: async (root) => {
+      $('[data-logout]', root).addEventListener('click', async () => {
+        try { await api('POST', '/auth/logout'); } catch { /* sai na mesma */ }
+        logoutLocal();
+      });
+      const f = $('[data-myiban]', root);
+      f.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        try { await api('POST', '/me/bank-account', { iban: f.iban.value, holder: f.holder.value }); toast(f.iban.value ? 'IBAN guardado.' : 'IBAN apagado.'); }
+        catch (err) { toast(err.message, true); }
+      });
+      const mine = await api('GET', '/me/bank-account');
+      if (mine.account) { f.iban.value = mine.account.iban; f.holder.value = mine.account.holder; }
+    },
     submit: async (f) => {
       await api('POST', '/me/pin', { pin: f.get('pin'), newPin: f.get('newPin') });
       done('PIN alterado.');
@@ -849,7 +964,8 @@ function openSheet(name, arg) {
   $('#sheet').hidden = false;
   bindClose();
   root.querySelectorAll('[data-go]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.go)));
-  const form = $('form', root);
+  // O formulário principal do ecrã (os marcados com data-own tratam do seu próprio envio).
+  const form = $('form:not([data-own])', root);
   if (def.setup) Promise.resolve(def.setup(root)).catch((err) => toast(err.message, true));
   if (!form || !def.submit) return;
   const key = newKey(); // mesma chave se o utilizador carregar duas vezes → nunca paga a dobrar
@@ -865,7 +981,7 @@ function openSheet(name, arg) {
     catch (err) {
       toast(err.message, true);
       const pin = form.querySelector('[name=pin]'); if (pin) pin.value = '';
-      if (err.code === 'rate_changed') form.dispatchEvent(new Event('change')); // mostra a nova cotação
+      if (['rate_changed', 'quote_expired', 'quote_used', 'quote_invalid'].includes(err.code)) form.dispatchEvent(new Event('change')); // mostra a nova cotação
     }
     finally { btn.disabled = false; }
   });

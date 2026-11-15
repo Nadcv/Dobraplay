@@ -57,5 +57,6 @@ module.exports = {
   CASHOUT_CODE_MINUTES: 30,
   CASHOUT_CODE_MAX_ATTEMPTS: 5,
   CHARGE_MINUTES: 15,      // validade de uma cobrança de loja (QR)
+  QUOTE_SECONDS: 60,       // câmbio garantido durante 60 s depois de o cliente ver a cotação
   BANK_DEPOSIT_DAYS: 7,    // pedido de carregamento por transferência fica aberto 7 dias
 };
