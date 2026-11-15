@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="pt-ST">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f7a3d">
+  <meta name="description" content="Envie, receba e peça dinheiro em Dobras, em São Tomé e Príncipe.">
+  <title>DobraPay</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Entrar / criar conta -->
+  <main id="auth" class="screen" hidden>
+    <div class="brand">
+      <img src="icon.svg" alt="" width="72" height="72">
+      <h1>DobraPay</h1>
+      <p>Envie e receba dinheiro entre São Tomé e Príncipe, Angola, Cabo Verde, Portugal e Espanha, em qualquer moeda.</p>
+    </div>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="login" class="active">Entrar</button>
+      <button type="button" role="tab" data-tab="register">Criar conta</button>
+    </div>
+    <form id="authForm" class="card" novalidate>
+      <label>País
+        <select name="country" id="authCountry"></select>
+      </label>
+      <label>Número de telemóvel
+        <div class="phone"><span id="authDial">+239</span><input name="phone" inputmode="tel" autocomplete="tel-national" placeholder="991 2345" required></div>
+      </label>
+      <label data-only="register" hidden>Nome completo
+        <input name="name" autocomplete="name" maxlength="60" placeholder="Ex.: Maria da Graça">
+      </label>
+      <label>PIN (4 a 6 dígitos)
+        <input name="pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6" autocomplete="current-password" required>
+      </label>
+      <p class="hint" data-only="register" hidden>Nunca partilhe o seu PIN, nem com agentes nem com funcionários.</p>
+      <button class="btn primary" type="submit">Entrar</button>
+    </form>
+  </main>
+
+  <!-- Ecrã principal -->
+  <main id="home" class="screen" hidden>
+    <header class="top">
+      <div>
+        <small>Olá,</small>
+        <strong id="hello"></strong>
+      </div>
+      <button type="button" class="icon-btn" data-open="profile" aria-label="Perfil">👤</button>
+    </header>
+
+    <section class="balance">
+      <small>Saldo disponível</small>
+      <button type="button" id="balance" class="amount" aria-label="Mostrar ou esconder saldo"></button>
+      <div id="wallets" class="wallets"></div>
+      <small id="limits" class="muted-light"></small>
+    </section>
+
+    <nav class="actions">
+      <button type="button" data-open="send"><span>↗</span>Enviar</button>
+      <button type="button" data-open="receive"><span>↙</span>Receber</button>
+      <button type="button" data-open="request"><span>✋</span>Pedir</button>
+      <button type="button" data-open="cashout"><span>💵</span>Levantar</button>
+      <button type="button" data-open="exchange"><span>⇄</span>Câmbio</button>
+    </nav>
+
+    <section id="agentBar" class="role-bar" hidden>
+      <strong>Agente</strong>
+      <button type="button" class="btn small" data-open="cashin">Depósito de cliente</button>
+      <button type="button" class="btn small" data-open="redeem">Levantamento de cliente</button>
+    </section>
+    <section id="adminBar" class="role-bar" hidden>
+      <strong>Admin</strong>
+      <button type="button" class="btn small" data-open="admin">Painel</button>
+      <button type="button" class="btn small" data-open="float">Emitir float</button>
+      <button type="button" class="btn small" data-open="rates">Câmbios</button>
+    </section>
+
+    <section id="pending"></section>
+
+    <section class="list-card">
+      <h2>Movimentos</h2>
+      <ul id="history" class="tx-list"></ul>
+    </section>
+  </main>
+
+  <!-- Folha (modal) reutilizada por todos os formulários -->
+  <div id="sheet" class="sheet" hidden>
+    <div class="sheet-body" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+      <div class="sheet-head">
+        <h2 id="sheetTitle"></h2>
+        <button type="button" class="icon-btn" data-close aria-label="Fechar">✕</button>
+      </div>
+      <div id="sheetContent"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

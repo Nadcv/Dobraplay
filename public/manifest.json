@@ -1,0 +1,11 @@
+{
+  "name": "DobraPay",
+  "short_name": "DobraPay",
+  "description": "Enviar, receber e pedir dinheiro em São Tomé e Príncipe.",
+  "lang": "pt-ST",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f3f5f2",
+  "theme_color": "#0f7a3d",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
