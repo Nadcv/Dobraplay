@@ -343,6 +343,50 @@ test('acerto entre bancos: mostra o que falta em cada moeda e regista a transfer
   assert.equal(eur2.owed_to_customers, eur.owed_to_customers); // os clientes não são afetados
 });
 
+test('limite de liquidez: pausa envios que deixariam o banco de uma moeda a dever demais', async () => {
+  // A Maria recebe em USD (escolheu antes): testa-se o limite do banco em USD.
+  const STN_PER_USD = 24.5 / (1.16 * 0.99); // Dobras necessárias para fazer chegar 1 USD
+  const eur = (await call('GET', '/admin/settlement', null, admin.token)).body.rows.find((r) => r.currency === 'USD');
+  assert.equal(eur.max_shortfall, null); // sem limite por omissão
+  // O banco em USD pode dever no máximo mais 10 USD do que já deve.
+  const limit = Math.max(0, -eur.surplus) + 1_000;
+  assert.equal((await call('POST', '/admin/liquidity', { currency: 'USD', max_shortfall: String(limit / 100), pin: '2580' }, ana.token)).status, 403);
+  const set = await call('POST', '/admin/liquidity', { currency: 'USD', max_shortfall: String(limit / 100), pin: '2580' }, admin.token);
+  assert.equal(set.status, 200, JSON.stringify(set.body));
+  const row = set.body.rows.find((r) => r.currency === 'USD');
+  assert.equal(row.max_shortfall, limit);
+  const available = row.available;
+  assert.ok(available >= 1_000 && available <= 1_000 + Math.max(0, eur.surplus));
+
+  // A cotação avisa e o envio é recusado (Ana em STN → Maria, que recebe em USD).
+  const big = Math.ceil((available + 2_000) * STN_PER_USD / 100);
+  const q = await call('GET', `/quote/transfer?to=%2B34612345678&amount=${big}&from_currency=STN`, null, ana.token);
+  assert.ok(q.body.paused, JSON.stringify(q.body));
+  const before = await bal(ana.token, 'STN');
+  const r = await call('POST', '/transfers', { to: '+34612345678', amount: String(big), from_currency: 'STN', pin: '2580' }, ana.token);
+  assert.equal(r.status, 503);
+  assert.equal(r.body.error, 'liquidity_paused');
+  assert.equal(await bal(ana.token, 'STN'), before); // nada saiu da carteira
+
+  // Envios na mesma moeda não são afetados; um envio pequeno passa.
+  assert.equal((await call('POST', '/transfers', { to: '9923456', amount: '10', pin: '2580' }, ana.token)).status, 200);
+  assert.equal((await call('POST', '/transfers', { to: '+34612345678', amount: '50', from_currency: 'STN', pin: '2580' }, ana.token)).status, 200);
+
+  // Vários envios ao mesmo tempo nunca ultrapassam o limite.
+  const left = (await call('GET', '/admin/settlement', null, admin.token)).body.rows.find((x) => x.currency === 'USD').available;
+  const each = Math.ceil((left / 3 + 50) * STN_PER_USD / 100); // cada um vale ~1/3 do disponível: só 2 podem passar
+  const par = await Promise.all([0, 1, 2, 3].map((i) =>
+    call('POST', '/transfers', { to: '+34612345678', amount: String(each), from_currency: 'STN', pin: '2580', idempotency_key: 'liq-' + i }, ana.token)));
+  assert.equal(par.filter((x) => x.status === 200).length, 2, JSON.stringify(par.map((x) => x.body.error || 'ok')));
+  const after = (await call('GET', '/admin/settlement', null, admin.token)).body.rows.find((x) => x.currency === 'USD');
+  assert.ok(after.surplus >= -limit, 'nunca passa o limite');
+
+  // Retirar o limite volta a permitir tudo.
+  const off = await call('POST', '/admin/liquidity', { currency: 'USD', max_shortfall: '', pin: '2580' }, admin.token);
+  assert.equal(off.body.rows.find((x) => x.currency === 'USD').max_shortfall, null);
+  assert.equal((await call('GET', `/quote/transfer?to=%2B34612345678&amount=${big}&from_currency=STN`, null, ana.token)).body.paused, undefined);
+});
+
 // ---------------- Pagamentos em lojas ----------------
 let charge;
 test('loja cria cobrança; cliente paga noutra moeda; a loja recebe o valor exato', async () => {

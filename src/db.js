@@ -178,6 +178,15 @@ const SCHEMA = `
   CREATE UNIQUE INDEX IF NOT EXISTS charges_code ON charges(code);
   CREATE INDEX IF NOT EXISTS charges_merchant ON charges(merchant_id, created_at);
 
+  -- Limite de liquidez por moeda: quanto o banco dessa moeda pode ficar a
+  -- dever aos clientes (à espera de um acerto entre bancos). Sem linha = sem limite.
+  CREATE TABLE IF NOT EXISTS liquidity_limits (
+    currency       TEXT PRIMARY KEY,
+    max_shortfall  INTEGER NOT NULL CHECK (max_shortfall >= 0),
+    updated_at     INTEGER NOT NULL,
+    updated_by     INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY,
     user_id  INTEGER,

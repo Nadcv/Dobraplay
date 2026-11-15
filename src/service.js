@@ -195,6 +195,23 @@ function createService(db, { adminPhone } = {}) {
     return { phone: u.phone, name: u.name, role: u.role, country: u.country, receive_currency: u.receive_currency };
   }
 
+  // ---------- Liquidez ----------
+  // Em cada moeda: excedente = dinheiro no banco − dinheiro dos clientes,
+  // que é exatamente o saldo da mesa de câmbio + taxas dessa moeda.
+  // Negativo = o banco dessa moeda está a dever (à espera de um acerto).
+  async function liquidity(cur, { lock = false } = {}) {
+    const fx = await db.get(`SELECT balance FROM accounts WHERE kind = 'fx' AND currency = ?${lock ? ' FOR UPDATE' : ''}`, cur);
+    const fees = await db.get("SELECT balance FROM accounts WHERE kind = 'fees' AND currency = ?", cur);
+    const lim = await db.get('SELECT max_shortfall FROM liquidity_limits WHERE currency = ?', cur);
+    const surplus = fx.balance + fees.balance;
+    const maxShortfall = lim ? lim.max_shortfall : null;
+    return { surplus, max_shortfall: maxShortfall, available: maxShortfall == null ? null : Math.max(0, surplus + maxShortfall) };
+  }
+
+  const liquidityError = (cur, available) => new ApiError(503, 'liquidity_paused', available > 0
+    ? `Neste momento só é possível fazer chegar até ${fmt(available, cur)} em ${cur}. Envie um valor menor ou tente mais tarde.`
+    : `Os envios que chegam em ${cur} estão temporariamente pausados enquanto reforçamos o dinheiro nesse país. Tente mais tarde.`);
+
   // ---------- Cotações ----------
   function feeFor(kind, amount, from, r) {
     return fromEur(C.FEES[kind](toEur(amount, from, r)), from, r);
@@ -210,7 +227,13 @@ function createService(db, { adminPhone } = {}) {
     if (exactTo != null) src = from === to ? exactTo : Math.ceil(exactTo / k - 1e-6);
     const toAmount = exactTo != null ? exactTo : (from === to ? src : Math.floor(src * k + 1e-6));
     const fee = feeFor(feeKind, src, from, r);
+    let paused;
+    if (from !== to) {
+      const liq = await liquidity(to);
+      if (liq.available != null && toAmount > liq.available) paused = { available: liq.available, message: liquidityError(to, liq.available).message };
+    }
     return {
+      ...(paused ? { paused } : {}),
       amount: src, currency: from, fee, total: src + fee,
       to_amount: toAmount, to_currency: to,
       rate: from === to ? 1 : Number(k.toPrecision(8)),
@@ -268,6 +291,14 @@ function createService(db, { adminPhone } = {}) {
     const cur = await accountById(fromAcc.id);
     if (cur.kind === 'wallet' && cur.balance < amount + fee) {
       throw new ApiError(402, 'insufficient_funds', `Saldo insuficiente. Disponível: ${fmt(cur.balance, currency)}.`);
+    }
+
+    // Limite de liquidez: com conversão, a mesa de câmbio paga na moeda de
+    // destino; não deixa o banco dessa moeda dever mais do que o permitido.
+    // Bloqueia a mesa dessa moeda para que dois envios ao mesmo tempo não passem o limite.
+    if (currency !== toCurrency && await db.get('SELECT 1 AS x FROM liquidity_limits WHERE currency = ?', toCurrency)) {
+      const liq = await liquidity(toCurrency, { lock: true });
+      if (toAmount > liq.available) throw liquidityError(toCurrency, liq.available);
     }
 
     const id = crypto.randomUUID();
@@ -883,7 +914,9 @@ function createService(db, { adminPhone } = {}) {
       const payouts = (await internal('payout', cur)).balance;
       const owed = Number(wallets) + payouts;
       const surplus = inBank - owed; // = taxas + mesa de câmbio
+      const liq = await liquidity(cur);
       rows.push({ currency: cur, in_bank: inBank, owed_to_customers: owed, surplus, surplus_eur: toEur(surplus, cur, r),
+        max_shortfall: liq.max_shortfall, available: liq.available,
         bank: bankAccountView(await db.get('SELECT * FROM company_bank_accounts WHERE currency = ?', cur)) });
     }
     // Sugestões: das moedas com excedente para as moedas em falta. As contas
@@ -904,6 +937,22 @@ function createService(db, { adminPhone } = {}) {
       }
     }
     return { rows, suggestions };
+  }
+
+  // Define (ou retira, com null) o limite de liquidez de uma moeda.
+  async function setLiquidityLimit(admin, { currency, maxShortfall, pin }, ip) {
+    requireRole(admin, 'admin');
+    needCurrency(currency);
+    if (maxShortfall != null && (!Number.isSafeInteger(maxShortfall) || maxShortfall < 0)) throw new ApiError(400, 'bad_amount', 'Valor inválido.');
+    await checkPin(admin, pin, ip);
+    if (maxShortfall == null) await db.run('DELETE FROM liquidity_limits WHERE currency = ?', currency);
+    else {
+      await db.run(`INSERT INTO liquidity_limits (currency, max_shortfall, updated_at, updated_by) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (currency) DO UPDATE SET max_shortfall = excluded.max_shortfall, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+      currency, maxShortfall, now(), admin.id);
+    }
+    await audit(admin.id, 'set_liquidity_limit', { currency, maxShortfall }, ip);
+    return settlementView(admin);
   }
 
   // Regista uma transferência feita entre dois bancos da empresa.
@@ -1033,7 +1082,7 @@ function createService(db, { adminPhone } = {}) {
     transfer, exchange, history, createRequest, listRequests, payRequest, closeRequest,
     cashIn, createCashoutCode, redeemCashout, issueFloat, listRates, setRate, setRole, listUsers, stats, ledgerCheck,
     listCompanyBankAccounts, setCompanyBankAccount, createBankDeposit, quoteBankWithdrawal, createBankWithdrawal, listMyBankRequests,
-    cancelBankRequest, adminListBankRequests, confirmBankDeposit, completeBankWithdrawal, rejectBankRequest, settlementView, recordSettlement,
+    cancelBankRequest, adminListBankRequests, confirmBankDeposit, completeBankWithdrawal, rejectBankRequest, settlementView, recordSettlement, setLiquidityLimit,
     createCharge, getCharge, payCharge, merchantCharge, listMerchantCharges, cancelCharge,
   };
 }

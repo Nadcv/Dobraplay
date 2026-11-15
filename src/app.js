@@ -218,6 +218,13 @@ function createApp(service) {
     return service.setCompanyBankAccount(req.user, { currency: b.currency, bankName: b.bank_name, holder: b.holder, iban: b.iban, swift: b.swift, pin: b.pin }, req.ip);
   }));
   api.get('/admin/settlement', auth, wrap((req) => service.settlementView(req.user)));
+  api.post('/admin/liquidity', auth, wrap((req) => {
+    const b = body(req);
+    const empty = b.max_shortfall == null || String(b.max_shortfall).trim() === '';
+    // "0" é válido (= só o que já está no banco); vazio = sem limite.
+    const v = empty ? null : (/^0+([.,]0{1,2})?$/.test(String(b.max_shortfall).trim()) ? 0 : amount(b.max_shortfall));
+    return service.setLiquidityLimit(req.user, { currency: b.currency, maxShortfall: v, pin: b.pin }, req.ip);
+  }));
   api.post('/admin/settlement', auth, wrap((req) => {
     const b = body(req);
     return service.recordSettlement(req.user, { fromCurrency: b.from_currency, toCurrency: b.to_currency, amount: amount(b.amount),

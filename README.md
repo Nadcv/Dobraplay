@@ -60,6 +60,14 @@ A empresa tem **uma conta bancária por moeda** (ex.: EUR na **Caixa Geral de De
 - **Levantar:** o cliente indica o seu IBAN (validado). O dinheiro **sai logo da carteira** e fica "por pagar". O admin faz a transferência no banco e marca-a como paga. Se recusar, ou se o cliente cancelar, o valor e a taxa voltam à carteira.
 - **Acerto entre bancos:** os envios entre países compensam-se dentro da app, por isso o dinheiro não atravessa a fronteira em cada envio. O ecrã **Acertos** mostra, em cada moeda, se o banco tem o dinheiro dos clientes e **sugere a transferência** a fazer entre os bancos da empresa (ex.: BISTP → CGD). Depois de a fazer, o admin regista-a e as contas ficam certas.
 
+### Limite de liquidez
+
+As remessas vão sobretudo num sentido (ex.: de Portugal para São Tomé), por isso o banco de uma moeda pode ficar a dever aos clientes até ao próximo acerto. Em **Acertos → Limite de liquidez**, o admin define, para cada moeda, a **falta máxima permitida** (vazio = sem limite; 0 = só com dinheiro já no banco).
+
+Se um envio **com câmbio** ultrapassar o limite, a app avisa o cliente **antes** de confirmar ("envios pausados…") e recusa a operação sem tocar no saldo. Envios na mesma moeda não são afetados. Depois de um acerto entre bancos, os envios voltam a passar automaticamente. A verificação bloqueia a mesa de câmbio dessa moeda, por isso vários envios ao mesmo tempo nunca ultrapassam o limite.
+
+Como cobrir a falta sem pausar envios: agentes que compram float (trazem dinheiro para o banco local), uma reserva inicial da empresa, ou uma linha de crédito do banco parceiro. **Nunca** com o dinheiro de outros clientes.
+
 ## Pagamentos em lojas
 
 O admin ativa a conta de loja de um cliente (**Painel → 🏪**). A loja carrega em **Cobrar**, escreve o valor e mostra o **QR code** ou o **código de 6 letras**. O cliente:
@@ -77,7 +85,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 22 testes automáticos (SQLite)
+npm test                            # 23 testes automáticos (SQLite)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 

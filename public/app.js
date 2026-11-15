@@ -84,7 +84,8 @@ function renderQuote(box, q, { getLabel = 'Recebe', payLabel = 'Paga' } = {}) {
   if (q.fee) rows.push(`<div><span>Total</span><strong>${esc(money(q.total, q.currency))}</strong></div>`);
   if (q.currency !== q.to_currency) rows.push(`<div><span>Câmbio</span><span>1 ${q.currency} = ${q.rate.toLocaleString('pt-PT', { maximumSignificantDigits: 6 })} ${q.to_currency}</span></div>`);
   rows.push(`<div class="get"><span>${getLabel}</span><span>${esc(money(q.to_amount, q.to_currency))}</span></div>`);
-  box.className = 'quote';
+  if (q.paused) rows.push(`<div style="color:var(--red);font-weight:600">⚠️ ${esc(q.paused.message)}</div>`);
+  box.className = q.paused ? 'quote err' : 'quote';
   box.innerHTML = rows.join('');
   box.hidden = false;
 }
@@ -683,6 +684,10 @@ const SHEETS = {
       <div class="row"><label>Para<select name="to_currency">${currencyOptions('EUR')}</select></label><label>Valor recebido<input name="to_amount" inputmode="decimal" required></label></div>
       <label>Referência (SWIFT/extrato)<input name="reference" maxlength="80" required></label>${pinField}
       <button class="btn primary">Registar acerto</button></form>
+      <h3 style="font-size:1rem;margin-top:20px">Limite de liquidez</h3>
+      <form data-limitform><p class="hint" style="margin-top:0">Quanto o banco de cada moeda pode ficar a dever aos clientes até ao próximo acerto. Se um envio com câmbio passar o limite, fica pausado com uma mensagem ao cliente. Vazio = sem limite; 0 = só com dinheiro já no banco.</p>
+      <div class="row"><label>Moeda<select name="currency">${currencyOptions('STN')}</select></label><label>Falta máxima<input name="max_shortfall" inputmode="decimal" placeholder="sem limite"></label></div>
+      ${pinField}<button class="btn primary">Guardar limite</button></form>
       <h3 style="font-size:1rem;margin-top:20px">Conta bancária da empresa</h3>
       <form data-bankform><div class="row"><label>Moeda<select name="currency">${currencyOptions('EUR')}</select></label><label>Banco<input name="bank_name" placeholder="Ex.: CGD, BISTP" required></label></div>
       <label>Titular<input name="holder" required></label><label>IBAN<input name="iban" required style="text-transform:uppercase"></label>
@@ -691,9 +696,10 @@ const SHEETS = {
     setup: async (root) => {
       const render = (v) => {
         $('[data-view]', root).innerHTML = `<p class="hint">Em cada moeda, o banco da empresa tem de ter pelo menos o dinheiro dos clientes. "Excedente" negativo = esse banco precisa de receber dinheiro de outro banco da empresa.</p>
-          <table class="cur"><tr><th>Moeda</th><th>Banco</th><th>Clientes</th><th>Excedente</th></tr>${v.rows.map((r) =>
+          <table class="cur"><tr><th>Moeda</th><th>Banco</th><th>Clientes</th><th>Excedente</th><th>Limite</th></tr>${v.rows.map((r) =>
             `<tr><td>${r.currency}<br><small>${esc(r.bank ? r.bank.bank_name : '—')}</small></td><td>${esc(money(r.in_bank, ''))}</td><td>${esc(money(r.owed_to_customers, ''))}</td>
-             <td style="color:${r.surplus < 0 ? 'var(--red)' : 'inherit'}">${esc(money(r.surplus, ''))}</td></tr>`).join('')}</table>
+             <td style="color:${r.surplus < 0 ? 'var(--red)' : 'inherit'}">${esc(money(r.surplus, ''))}</td>
+             <td>${r.max_shortfall == null ? '—' : `${esc(money(r.max_shortfall, ''))}<br><small style="color:${r.available ? 'inherit' : 'var(--red)'}">${r.available ? 'livre ' + esc(money(r.available, '')) : '⏸ pausado'}</small>`}</td></tr>`).join('')}</table>
           ${v.suggestions.length ? `<div class="quote"><strong>Sugestão de acerto</strong>${v.suggestions.map((s) =>
             `<div><span>${esc(money(s.amount, s.from_currency))} → ${esc(money(s.to_amount, s.to_currency))}</span><span>≈ ${esc(money(s.eur, 'EUR'))}</span></div>`).join('')}</div>` : '<p class="who">Contas equilibradas: não é preciso transferir nada. ✓</p>'}`;
       };
@@ -708,6 +714,16 @@ const SHEETS = {
           toast(`Conta bancária em ${f.get('currency')} guardada.`); bankForm.reset(); render(await api('GET', '/admin/settlement'));
         } catch (err) { toast(err.message, true); }
         finally { btn.disabled = false; }
+      });
+      const limitForm = $('[data-limitform]', root);
+      limitForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const f = new FormData(limitForm);
+        try {
+          render(await api('POST', '/admin/liquidity', Object.fromEntries(f)));
+          toast(f.get('max_shortfall') ? `Limite de ${f.get('currency')} guardado.` : `Limite de ${f.get('currency')} retirado.`);
+          limitForm.querySelector('[name=pin]').value = '';
+        } catch (err) { toast(err.message, true); }
       });
       render(await api('GET', '/admin/settlement'));
     },
@@ -854,7 +870,8 @@ function openSheet(name, arg) {
     finally { btn.disabled = false; }
   });
   const first = form.querySelector('input:not([type=hidden]):not([value]), input[value=""]');
-  if (first) setTimeout(() => first.focus(), 50);
+  // Põe o cursor no primeiro campo, mas só se a pessoa ainda não tiver tocado noutro.
+  if (first) setTimeout(() => { if (!root.contains(document.activeElement)) first.focus(); }, 50);
 }
 
 // Lê os endereços dos QR codes: ".../?pagar=CODIGO" (loja) ou ".../?enviar=+239…&valor=…" (pessoa).
