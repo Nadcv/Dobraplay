@@ -908,6 +908,111 @@ test('cartão: se o webhook atrasar, a app confirma ao voltar da página de paga
   assert.equal(await bal(maria.token, 'EUR'), before + 2_000);
 });
 
+// ---------------- Extratos bancários e pagamentos em lote (BISTP / CGD) ----------------
+test('extrato do BISTP (CSV): encontra as referências, confirma com o valor recebido e nunca usa a mesma linha duas vezes', async () => {
+  const d1 = (await call('POST', '/bank/deposits', { amount: '500', currency: 'STN' }, ana.token)).body;
+  const d2 = (await call('POST', '/bank/deposits', { amount: '300', currency: 'STN' }, bruno.token)).body;
+  assert.match(d1.reference, /^DP/);
+  const csv = [
+    'BISTP - Banco Internacional de S. Tomé e Príncipe',
+    'Extrato de conta;ST09 0001 0000 0012 3456 7890 1',
+    '',
+    'Data Mov.;Data Valor;Descritivo;Débito;Crédito;Saldo',
+    `05/11/2026;05/11/2026;TRF DE ANA COSTA REF ${d1.reference};;500,00;12.500,00`,
+    '06/11/2026;06/11/2026;TRF SEM REFERENCIA;;1.000,00;13.500,00',
+    '06/11/2026;06/11/2026;COMISSAO MANUTENCAO;2,50;;13.497,50',
+    `07/11/2026;07/11/2026;"TRF ${d2.reference.toLowerCase()} BRUNO; NETO";;290,00;13.787,50`,
+  ].join('\r\n');
+  assert.equal((await call('POST', '/admin/statements', { currency: 'STN', content: csv }, ana.token)).status, 403);
+  const p = await call('POST', '/admin/statements', { currency: 'STN', content: csv, filename: 'extrato-bistp.csv' }, admin.token);
+  assert.equal(p.status, 200, JSON.stringify(p.body));
+  assert.equal(p.body.format, 'csv');
+  assert.equal(p.body.rows.length, 3); // a comissão (débito) é ignorada
+  const byRef = (ref) => p.body.rows.find((r) => r.reference === ref);
+  assert.equal(byRef(d1.reference).state, 'match');
+  assert.equal(byRef(d1.reference).user.name, 'Ana Costa');
+  assert.equal(byRef(d2.reference).state, 'amount_differs');
+  assert.equal(byRef(d2.reference).amount, 29_000);
+  assert.equal(p.body.rows.find((r) => !r.reference).state, 'unmatched');
+  assert.deepEqual(p.body.summary, { credits: 3, match: 1, amount_differs: 1, already: 0, unmatched: 1 });
+
+  const anaBefore = await bal(ana.token, 'STN'), brunoBefore = await bal(bruno.token, 'STN');
+  const c = await call('POST', `/admin/statements/${p.body.import_id}/confirm`, { line_ids: [byRef(d1.reference).line_id, byRef(d2.reference).line_id], pin: '2580' }, admin.token);
+  assert.equal(c.body.confirmed, 2, JSON.stringify(c.body));
+  assert.equal(await bal(ana.token, 'STN'), anaBefore + 50_000);
+  assert.equal(await bal(bruno.token, 'STN'), brunoBefore + 29_000); // o que realmente chegou
+  // O mesmo extrato importado outra vez: as linhas já usadas aparecem como tratadas e não creditam de novo.
+  const again = await call('POST', '/admin/statements', { currency: 'STN', content: csv }, admin.token);
+  assert.equal(again.body.summary.already, 2);
+  const c2 = await call('POST', `/admin/statements/${again.body.import_id}/confirm`, { line_ids: again.body.rows.map((r) => r.line_id), pin: '2580' }, admin.token);
+  assert.equal(c2.body.confirmed, 0);
+  assert.equal(await bal(ana.token, 'STN'), anaBefore + 50_000);
+});
+
+test('extratos MT940 e CAMT.053 (formatos bancários internacionais) também são lidos', async () => {
+  const d = (await call('POST', '/bank/deposits', { amount: '75,50', currency: 'EUR' }, maria.token)).body;
+  const mt940 = [':20:STMT2026111', ':25:PT50000201231234567890154', ':28C:00001/001', ':60F:C261110EUR1000,00',
+    ':61:2611101110C75,50NTRFNONREF//1234', `:86:TRF SEPA DE MARIA ESPANHA ${d.reference}`,
+    ':61:2611101110D10,00NMSCNONREF', ':86:COMISSAO', ':62F:C261110EUR1065,50', '-'].join('\r\n');
+  const p = (await call('POST', '/admin/statements', { currency: 'EUR', content: mt940 }, admin.token)).body;
+  assert.equal(p.format, 'mt940');
+  assert.equal(p.rows.length, 1);
+  assert.equal(p.rows[0].state, 'match');
+  assert.equal(p.rows[0].date, '2026-11-10');
+  const d2 = (await call('POST', '/bank/deposits', { amount: '20', currency: 'EUR' }, maria.token)).body;
+  const camt = `<?xml version="1.0"?><Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02"><BkToCstmrStmt><Stmt>
+    <Ntry><Amt Ccy="EUR">20.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2026-11-12</Dt></BookgDt>
+      <NtryDtls><TxDtls><RltdPties><Dbtr><Nm>Maria Espanha</Nm></Dbtr></RltdPties><RmtInf><Ustrd>Carregamento ${d2.reference}</Ustrd></RmtInf></TxDtls></NtryDtls></Ntry>
+    <Ntry><Amt Ccy="EUR">5.00</Amt><CdtDbtInd>DBIT</CdtDbtInd><BookgDt><Dt>2026-11-12</Dt></BookgDt></Ntry>
+  </Stmt></BkToCstmrStmt></Document>`;
+  const q = (await call('POST', '/admin/statements', { currency: 'EUR', content: camt }, admin.token)).body;
+  assert.equal(q.format, 'camt053');
+  assert.equal(q.rows.length, 1);
+  assert.equal(q.rows[0].state, 'match');
+  assert.equal(q.rows[0].amount, 2_000);
+  assert.equal((await call('POST', '/admin/statements', { currency: 'EUR', content: 'isto não é um extrato' }, admin.token)).body.error, 'bad_statement');
+});
+
+test('pagar em lote: ficheiro SEPA para a CGD, o cliente já não pode cancelar, marcar o lote como pago', async () => {
+  await call('POST', '/admin/payout-providers', { currency: 'EUR', provider: 'manual', pin: '2580' }, admin.token);
+  const w1 = (await call('POST', '/bank/withdrawals', { amount: '12,34', currency: 'EUR', iban: IBAN_MARIA, holder: 'María Espanha', pin: '2580' }, maria.token)).body.request;
+  const w2 = (await call('POST', '/bank/withdrawals', { amount: '5', currency: 'EUR', iban: IBAN_MARIA, holder: 'Maria Espanha', pin: '2580' }, maria.token)).body.request;
+  const prev = (await call('GET', '/admin/payout-batches/preview?currency=EUR', null, admin.token)).body;
+  assert.ok(prev.count >= 2);
+  assert.equal((await call('POST', '/admin/payout-batches', { currency: 'STN', format: 'sepa', pin: '2580' }, admin.token)).body.error, 'sepa_eur_only');
+  const b = await call('POST', '/admin/payout-batches', { currency: 'EUR', format: 'sepa', pin: '2580' }, admin.token);
+  assert.equal(b.status, 200, JSON.stringify(b.body));
+  const xml = b.body.content;
+  assert.match(xml, /urn:iso:std:iso:20022:tech:xsd:pain\.001\.001\.03/);
+  assert.match(xml, new RegExp(`<NbOfTxs>${b.body.count}</NbOfTxs>`));
+  assert.match(xml, new RegExp(`<CtrlSum>${(b.body.total / 100).toFixed(2)}</CtrlSum>`));
+  assert.match(xml, /<IBAN>PT50000201231234567890154<\/IBAN>/); // conta da empresa (CGD)
+  assert.match(xml, /<IBAN>ES9121000418450200051332<\/IBAN>/);
+  assert.match(xml, /<Nm>Maria Espanha<\/Nm>/); // "María" sem acento (SEPA)
+  assert.match(xml, new RegExp(`<EndToEndId>${w1.reference}</EndToEndId>`));
+  assert.match(xml, /<InstdAmt Ccy="EUR">12\.34<\/InstdAmt>/);
+  assert.equal((await call('POST', `/bank/requests/${w2.id}/cancel`, null, maria.token)).body.error, 'already_sent');
+  assert.equal((await call('POST', '/admin/payout-batches', { currency: 'EUR', format: 'sepa', pin: '2580' }, admin.token)).body.error, 'nothing_pending');
+  const paid = await call('POST', `/admin/payout-batches/${b.body.batch_id}/paid`, { bank_reference: 'CGD-LOTE-77', pin: '2580' }, admin.token);
+  assert.equal(paid.body.paid, b.body.count);
+  const mine = (await call('GET', '/bank/requests', null, maria.token)).body;
+  assert.equal(mine.find((r) => r.id === w1.id).status, 'completed');
+  assert.match(mine.find((r) => r.id === w1.id).bank_reference, /CGD-LOTE-77/);
+  assert.equal((await call('GET', '/admin/payout-batches', null, admin.token)).body[0].status, 'paid');
+});
+
+test('pagar em lote em Dobras (CSV para o BISTP); cancelar o lote devolve os pedidos ao estado normal', async () => {
+  await call('POST', '/admin/payout-providers', { currency: 'STN', provider: 'manual', pin: '2580' }, admin.token);
+  const w = (await call('POST', '/bank/withdrawals', { amount: '100', currency: 'STN', iban: IBAN_ROSA, holder: 'Ana Costa', pin: '2580' }, ana.token)).body.request;
+  const b = (await call('POST', '/admin/payout-batches', { currency: 'STN', format: 'csv', pin: '2580' }, admin.token)).body;
+  assert.ok(b.content.startsWith('﻿IBAN;Titular;Valor;Moeda;Descritivo'));
+  assert.match(b.content, new RegExp(`ST03000200000098765432101;Ana Costa;100,00;STN;DobraPay ${w.reference}`));
+  const cancel = await call('POST', `/admin/payout-batches/${b.batch_id}/cancel`, { pin: '2580' }, admin.token);
+  assert.equal(cancel.body.status, 'cancelled');
+  const back = await call('POST', `/bank/requests/${w.id}/cancel`, null, ana.token); // o cliente já pode cancelar
+  assert.equal(back.body.status, 'cancelled');
+});
+
 test('livro-razão: em cada moeda a soma de todos os saldos é zero', async () => {
   const s = (await call('GET', '/admin/stats', null, admin.token)).body;
   assert.equal(s.ledger.ok, true, JSON.stringify(s.ledger));

@@ -817,7 +817,8 @@ const SHEETS = {
   // ---------- Admin: banco ----------
   bankAdmin: () => ({
     title: 'Transferências bancárias',
-    html: `<label>O seu PIN (para confirmar operações)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label>
+    html: `<div class="row" style="margin-bottom:12px"><button type="button" class="btn small" data-go="statementImport">📄 Importar extrato</button><button type="button" class="btn small" data-go="payoutBatch">📦 Pagar em lote</button></div>
+      <label>O seu PIN (para confirmar operações)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label>
       <div data-reqs><p class="hint">A carregar…</p></div>`,
     setup: async (root) => {
       const pin = () => $('[data-adminpin]', root).value;
@@ -1107,6 +1108,73 @@ const SHEETS = {
       await api('POST', '/me/kyc', { full_name: f.get('full_name'), doc_type: f.get('doc_type'), doc_number: f.get('doc_number'),
         birth_date: f.get('birth_date'), doc_image: form._imgs.doc, selfie_image: form._imgs.selfie });
       done(t('Enviado! Vamos analisar e avisamos assim que estiver verificado.'));
+    },
+  }),
+
+
+  // ---------- Admin: importar extrato do banco ----------
+  statementImport: () => ({
+    title: 'Importar extrato bancário',
+    html: `<form><p class="hint" style="margin-top:0">Descarregue o extrato no homebanking (BISTP, CGD…) e escolha-o aqui. Formatos: <b>CSV</b> (ou Excel guardado como CSV), <b>MT940</b> ou <b>CAMT.053</b>. A app encontra as referências <b>DP…</b> dos carregamentos.</p>
+      <div class="row"><label>Conta (moeda)<select name="currency"></select></label><label>Ficheiro<input type="file" name="file" accept=".csv,.txt,.xml,.sta,.940,.mt940" required></label></div>
+      <button class="btn primary">Ler extrato</button></form><div data-result></div>`,
+    setup: async (root) => {
+      const banks = await api('GET', '/bank/accounts');
+      $('[name=currency]', root).innerHTML = banks.map((b) => `<option value="${b.currency}">${b.currency} · ${esc(b.bank_name)}</option>`).join('') || '<option value="STN">STN</option>';
+    },
+    submit: async (f, key, form) => {
+      const file = form.file.files[0];
+      if (!file) throw new Error('Escolha o ficheiro do extrato.');
+      const content = await readTextFile(file);
+      const r = await api('POST', '/admin/statements', { currency: f.get('currency'), content, filename: file.name });
+      renderStatement($('[data-result]', form.parentElement), r);
+    },
+  }),
+
+  // ---------- Admin: pagar levantamentos em lote ----------
+  payoutBatch: () => ({
+    title: 'Pagar levantamentos em lote',
+    html: `<form><p class="hint" style="margin-top:0">Junta todos os levantamentos pendentes de uma moeda num ficheiro para carregar no homebanking. Os pedidos ficam bloqueados (o cliente já não os pode cancelar) até marcar o lote como pago ou o cancelar.</p>
+      <div class="row"><label>Moeda<select name="currency">${currencyOptions('EUR', ['EUR', 'STN', 'AOA', 'CVE', 'USD'])}</select></label>
+      <label>Formato<select name="format"><option value="sepa">SEPA XML (euros: CGD e bancos da UE)</option><option value="csv">CSV (BISTP e outros)</option></select></label></div>
+      <div class="quote" data-prev>A carregar…</div>${pinField}
+      <button class="btn primary">⬇ Gerar ficheiro do lote</button></form>
+      <h3 style="font-size:1rem;margin-top:18px">Lotes</h3><input data-adminpin type="password" inputmode="numeric" maxlength="6" placeholder="PIN (para marcar pago / cancelar)" style="margin-bottom:10px"><div data-batches></div>`,
+    setup: async (root) => {
+      const form = $('form', root);
+      const prev = async () => {
+        const p = await api('GET', '/admin/payout-batches/preview?' + qs({ currency: form.currency.value }));
+        $('[data-prev]', root).innerHTML = p.count ? `<div><span>Levantamentos pendentes</span><strong>${p.count}</strong></div><div><span>Total a transferir</span><strong>${esc(money(p.total, p.currency))}</strong></div>`
+          : '<div><span>Não há levantamentos pendentes nesta moeda.</span></div>';
+        if (form.currency.value !== 'EUR') form.format.value = 'csv';
+      };
+      form.currency.addEventListener('change', prev);
+      const loadBatches = async () => {
+        const list = await api('GET', '/admin/payout-batches');
+        $('[data-batches]', root).innerHTML = list.map((b) => `<div class="req-card" data-id="${esc(b.id)}"><div class="copy-row"><div><strong>${esc(b.id)}</strong>
+          <small>${b.count} pagamentos · ${esc(money(b.total, b.currency))} · ${esc(when(b.created_at))}${b.bank_reference ? ' · ref. ' + esc(b.bank_reference) : ''}</small></div>
+          <span class="tag ${b.status === 'paid' ? 'completed' : b.status === 'cancelled' ? 'cancelled' : 'pending'}">${{ exported: 'Por pagar', paid: 'Pago', cancelled: 'Cancelado' }[b.status]}</span></div>
+          ${b.status === 'exported' ? `<div class="row" style="margin-top:8px"><input data-ref placeholder="Ref. do lote no banco"><button type="button" class="btn small primary" data-paid style="width:auto">Marcar pago</button><button type="button" class="btn small danger" data-cancel-batch>Cancelar</button></div>` : ''}</div>`).join('')
+          || '<p class="empty">Ainda não há lotes.</p>';
+        root.querySelectorAll('[data-batches] .req-card').forEach((card) => {
+          const pin = () => $('[data-adminpin]', root).value;
+          const go = async (fn, msg) => { try { await fn(); toast(msg); loadBatches(); prev(); } catch (err) { toast(err.message, true); } };
+          const paidBtn = $('[data-paid]', card), cancelBtn = $('[data-cancel-batch]', card);
+          if (paidBtn) paidBtn.addEventListener('click', () => go(() => api('POST', `/admin/payout-batches/${encodeURIComponent(card.dataset.id)}/paid`, { bank_reference: $('[data-ref]', card).value, pin: pin() }), 'Lote marcado como pago.'));
+          if (cancelBtn) cancelBtn.addEventListener('click', () => { if (confirm('Cancelar o lote? Os levantamentos voltam a ficar por pagar.')) go(() => api('POST', `/admin/payout-batches/${encodeURIComponent(card.dataset.id)}/cancel`, { pin: pin() }), 'Lote cancelado.'); });
+        });
+      };
+      form._reload = () => { prev(); loadBatches(); };
+      await Promise.all([prev(), loadBatches()]);
+    },
+    submit: async (f, key, form) => {
+      const r = await api('POST', '/admin/payout-batches', { currency: f.get('currency'), format: f.get('format'), pin: f.get('pin') });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([r.content], { type: r.mime + ';charset=utf-8' }));
+      a.download = r.filename; a.click();
+      toast(`Lote ${r.batch_id}: ${r.count} pagamentos (${money(r.total, f.get('currency'))}). Carregue o ficheiro no homebanking.`);
+      form.pin.value = '';
+      form._reload();
     },
   }),
 
@@ -1458,6 +1526,44 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet
 document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.open)));
 
 
+
+
+// Lê o ficheiro do extrato: tenta UTF-8 e, se falhar, Windows-1252 (comum nos bancos).
+async function readTextFile(file) {
+  const buf = await file.arrayBuffer();
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { return new TextDecoder('windows-1252').decode(buf); }
+}
+
+const STATEMENT_STATE = {
+  match: ['✅ Corresponde', 'completed'], amount_differs: ['⚠️ Valor diferente', 'pending'], already: ['✓ Já tratado', 'cancelled'],
+  unmatched: ['Sem referência', 'rejected'], unknown_ref: ['Referência desconhecida', 'rejected'], wrong_currency: ['Outra moeda', 'rejected'],
+  request_closed: ['Pedido já fechado', 'cancelled'],
+};
+function renderStatement(box, r) {
+  const s = r.summary;
+  box.innerHTML = `<div class="quote" style="margin-top:14px"><div><span>Formato</span><strong>${esc(r.format.toUpperCase())}</strong></div>
+      <div><span>Entradas no extrato</span><strong>${s.credits}</strong></div><div><span>Correspondem</span><strong>${s.match}</strong></div>
+      <div><span>Valor diferente</span><strong>${s.amount_differs}</strong></div><div><span>Já tratadas</span><strong>${s.already}</strong></div>
+      <div><span>Sem correspondência</span><strong>${s.unmatched}</strong></div></div>
+    ${r.rows.map((x) => { const [label, cls] = STATEMENT_STATE[x.state] || [x.state, '']; const can = x.state === 'match' || x.state === 'amount_differs';
+      return `<div class="req-card"><label class="check" style="margin:0">${can ? `<input type="checkbox" data-line="${x.line_id}" ${x.state === 'match' ? 'checked' : ''}>` : ''}
+        <span><strong>${esc(money(x.amount, r.currency))}</strong> · ${esc(x.date || '')} <span class="tag ${cls}">${esc(label)}</span><br>
+        <small>${esc(x.description || '')}${x.user ? ` · <b>${esc(x.user.name)}</b> (${esc(prettyPhone(x.user.phone))})` : ''}${x.state === 'amount_differs' ? ` · pedido: ${esc(money(x.expected, r.currency))}, credita o valor recebido` : ''}</small></span></label></div>`; }).join('')}
+    ${r.rows.some((x) => x.state === 'match' || x.state === 'amount_differs') ? `<label>O seu PIN<input data-stpin type="password" inputmode="numeric" maxlength="6"></label>
+      <button type="button" class="btn primary" data-confirm-st>Confirmar carregamentos selecionados</button>` : ''}
+    ${s.unmatched ? '<p class="hint">As entradas sem correspondência ficam para análise: confirme-as à mão em Banco, se souber de quem são.</p>' : ''}`;
+  const btn = $('[data-confirm-st]', box);
+  if (btn) btn.addEventListener('click', async () => {
+    const ids = [...box.querySelectorAll('[data-line]:checked')].map((c) => Number(c.dataset.line));
+    try {
+      const c = await api('POST', `/admin/statements/${r.import_id}/confirm`, { line_ids: ids, pin: $('[data-stpin]', box).value });
+      const failed = c.results.filter((x) => !x.ok);
+      toast(`${c.confirmed} carregamentos confirmados.${failed.length ? ` ${failed.length} falharam: ${failed[0].error}` : ''}`, failed.length > 0);
+      box.innerHTML = `<p class="who">✓ ${c.confirmed} carregamentos confirmados e creditados.</p>`;
+      refresh();
+    } catch (err) { toast(err.message, true); }
+  });
+}
 
 // Ao voltar da página da Stripe: espera pela confirmação do pagamento.
 async function waitCardTopup(id, result) {
