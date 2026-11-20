@@ -35,6 +35,15 @@ services:
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
+      # Códigos de verificação por e-mail (grátis): Resend primeiro, Brevo se a Resend falhar ou chegar ao limite.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_FROM
+        sync: false
       # Alertas de movimento por e-mail: segredo do endereço (gerado pelo Render) e remetentes do banco.
       - key: BANK_EMAIL_TOKEN
         generateValue: true

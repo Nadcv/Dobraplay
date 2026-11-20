@@ -35,7 +35,10 @@
       <label data-only="register" hidden><span data-i18n="Nome completo">Nome completo</span>
         <input name="name" autocomplete="name" maxlength="60" placeholder="Ex.: Maria da Graça">
       </label>
-      <label data-only="code" hidden><span data-i18n="Código recebido por SMS">Código recebido por SMS</span>
+      <label data-only="register" hidden><span data-i18n="E-mail">E-mail</span>
+        <input name="email" type="email" inputmode="email" autocomplete="email" maxlength="254" placeholder="nome@exemplo.com">
+      </label>
+      <label data-only="code" hidden><span data-codelabel>Código recebido</span>
         <input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" class="code-input">
       </label>
       <p class="who" data-devcode hidden></p>

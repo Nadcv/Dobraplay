@@ -105,6 +105,19 @@ Troque `STN`/`EUR` pela moeda da conta (uma ligação por moeda). A verificaçã
 
 **Open Banking:** cada agregador tem a sua API. A app lê um formato normalizado simples; depois de escolher o agregador, basta um pequeno adaptador (ou um serviço intermédio) que devolva esse formato.
 
+## Códigos de verificação por e-mail (grátis)
+
+O código de 6 dígitos do registo, de "Esqueci o PIN" e da mudança de e-mail chega **por e-mail**, sem custos:
+
+1. **Resend** (`RESEND_API_KEY`). É tentado primeiro.
+2. **Brevo** (`BREVO_API_KEY` + `BREVO_FROM`). Se a Resend falhar, recusar o remetente ou chegar ao limite grátis, o código segue automaticamente pela Brevo. Quando o limite é diário, a Resend fica de parte até ao dia seguinte.
+
+- Sem nenhuma chave, a app fica em **modo de teste**: o código aparece no ecrã.
+- O código fica ligado ao número **e** ao e-mail a que foi enviado.
+- "Esqueci o PIN" envia o código para o e-mail guardado na conta, sem o mostrar a quem pede. Quem ainda não tem e-mail pode juntá-lo em **Perfil → Juntar e-mail**.
+- A Resend, **sem domínio próprio verificado**, só entrega no e-mail do dono da conta Resend. Até haver domínio, os outros envios passam pela Brevo.
+- Na Brevo basta verificar um e-mail de remetente (ex.: o seu Gmail) e pô-lo em `BREVO_FROM`.
+
 ## Carregar com cartão (Stripe)
 
 Os clientes carregam a carteira com **Visa, Mastercard, Apple Pay ou Google Pay** através da **Stripe Checkout**:
@@ -195,6 +208,8 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | `DB_FILE` | Sem `DATABASE_URL`, usa este ficheiro SQLite (por omissão `data/dobrapay.db`), só para o computador |
 | `ADMIN_PHONE` | Número da conta administradora |
 | `APP_NAME` | Nome da marca (por omissão DobraPay) |
+| `RESEND_API_KEY` / `RESEND_FROM` | Códigos por e-mail (1.º). `RESEND_FROM` ex.: `DobraPay <codigos@o-seu-dominio>`; sem domínio usa `onboarding@resend.dev` |
+| `BREVO_API_KEY` / `BREVO_FROM` | Códigos por e-mail se a Resend falhar ou chegar ao limite. `BREVO_FROM` = remetente verificado na Brevo |
 | `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | Carregar com cartão (Stripe). Sem isto, a opção não aparece |
 | `SMS_HTTP_URL` / `SMS_HTTP_TOKEN` | Fornecedor de SMS (`POST { to, message }`). Sem isto, os códigos aparecem no ecrã (modo de teste) |
 | `OTP_REQUIRED` | `false` desliga o código por SMS no registo (não recomendado) |
@@ -259,7 +274,7 @@ src/app.js         API HTTP + segurança (rate limit, cabeçalhos, webhooks assi
 src/payouts.js     parceiros de pagamento (manual, simulador, API)
 src/features/      sms, push, kyc (identidade), aml (alertas + CSV), passkeys (Face ID),
                    scheduled (envios mensais), bills (recargas/contas), agents (mapa + comissões),
-                   ussd, receipts (comprovativos), cards (carregar com cartão, Stripe),
+                   ussd, mail (códigos por e-mail: Resend → Brevo), receipts (comprovativos), cards (carregar com cartão, Stripe),
                    statements (importar extratos e pagar em lote: CSV, MT940, CAMT.053, SEPA),
                    banksync (ligações automáticas: SFTP, pasta, Open Banking, alertas por e-mail)
 public/i18n.js     traduções (PT, ES, EN, FR)
