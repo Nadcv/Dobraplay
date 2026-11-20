@@ -275,6 +275,7 @@ function logoutLocal() {
   closeSheet();
   $('#home').hidden = true;
   $('#auth').hidden = false;
+  closeMenu();
 }
 
 // ---------------- Ecrã principal ----------------
@@ -319,6 +320,7 @@ function renderMe() {
   $('#limits').textContent = m.limits.daily ? `Limite diário: ${money(m.limits.dailyUsed, 'EUR')} de ${money(m.limits.daily, 'EUR')} usados` : '';
   $('#agentBar').hidden = !['agent', 'admin'].includes(m.role);
   $('#adminBar').hidden = m.role !== 'admin';
+  $('#menuBtn').hidden = !['agent', 'admin'].includes(m.role); // o menu ⋮ só aparece a agentes e admin
   $('#merchantBar').hidden = !m.merchant_name;
   if (m.merchant_name) $('#merchantName').textContent = '🏪 ' + m.merchant_name;
 }
@@ -1587,7 +1589,7 @@ function closeSheet() {
   $('#sheetContent').innerHTML = '';
 }
 $('#sheet').addEventListener('click', (e) => { if (e.target.id === 'sheet') closeSheet(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeSheet(); closeMenu(); } });
 document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.open)));
 
 
@@ -1725,6 +1727,20 @@ async function pushEnabled() {
   const reg = await navigator.serviceWorker.ready;
   return !!(await reg.pushManager.getSubscription());
 }
+
+
+// ---------------- Menu ⋮ (agente e administração) ----------------
+function openMenu() { $('#menu').hidden = false; $('#menuBtn').setAttribute('aria-expanded', 'true'); }
+function closeMenu() { $('#menu').hidden = true; $('#menuBtn').setAttribute('aria-expanded', 'false'); }
+$('#menuBtn').addEventListener('click', openMenu);
+$('#menuClose').addEventListener('click', closeMenu);
+$('#menu').addEventListener('click', (e) => { if (e.target.id === 'menu') closeMenu(); });
+// Ao escolher uma opção do menu, fecha o menu e abre o ecrã.
+$('#menu').querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', closeMenu, true));
+// Ponto amarelo no ⋮ quando há pedidos à espera (banco, identidade, alertas).
+new MutationObserver(() => {
+  $('#menuDot').hidden = !['#bankBadge', '#kycBadge', '#alertBadge'].some((id) => $(id) && $(id).textContent);
+}).observe($('#menu'), { childList: true, subtree: true, characterData: true });
 
 // ---------------- Arranque ----------------
 // Nenhum formulário é enviado "à moda antiga" (isso recarregava a página e
