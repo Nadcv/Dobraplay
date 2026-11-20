@@ -8,6 +8,7 @@ const C = require('./config');
 const { isUniqueViolation } = require('./db');
 const { createPayoutProviders } = require('./payouts');
 const { createSmsSender } = require('./features/sms');
+const { createMailSender } = require('./features/mail');
 const {
   ApiError, normalizePhone, countryOfPhone, isCurrency, hashPin, verifyPin, isValidPin, sha256, cleanText, formatAmount,
   normalizeIban, formatIban, randomCode,
@@ -23,9 +24,12 @@ const fmt = formatAmount;
 let seqCounter = 0;
 const nextSeq = () => now() * 1000 + (seqCounter++ % 1000);
 
-function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsSender, pushSender, requireOtp } = {}) {
+function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsSender, mailSender, pushSender, requireOtp } = {}) {
   const adminPhoneNorm = adminPhone ? normalizePhone(adminPhone) : null;
   const sms = smsSender || createSmsSender(env);
+  const mail = mailSender || createMailSender(env);
+  // Por onde seguem os códigos: e-mail (Resend → Brevo), SMS, ou modo de teste (código no ecrã).
+  const otpChannel = !mail.sandbox ? 'email' : !sms.sandbox ? 'sms' : 'sandbox';
   // Verificação por SMS obrigatória no registo (desliga-se com OTP_REQUIRED=false).
   const otpRequired = requireOtp ?? env.OTP_REQUIRED !== 'false';
 
@@ -95,7 +99,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     const r = await rates();
     const wallets = (await walletsOf(u.id)).map((w) => ({ currency: w.currency, balance: w.balance }));
     return {
-      id: u.id, phone: u.phone, name: u.name, role: u.role, tier: u.tier, merchant_name: u.merchant_name || null,
+      id: u.id, phone: u.phone, name: u.name, email: u.email || null, role: u.role, tier: u.tier, merchant_name: u.merchant_name || null,
       country: u.country, home_currency: homeCurrency(u), receive_currency: u.receive_currency,
       wallets,
       total_eur: wallets.reduce((s, w) => s + toEur(w.balance, w.currency, r), 0),
@@ -127,43 +131,112 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     if (user.failed_pins) await db.run('UPDATE users SET failed_pins = 0 WHERE id = ?', user.id);
   }
 
-  // ---------- Verificação por SMS ----------
-  const otpHash = (phone, purpose, code) => sha256(`${phone}|${purpose}|${code}`);
+  // ---------- Códigos de verificação (e-mail ou SMS) ----------
+  // O código fica ligado ao número E ao e-mail a que foi enviado: não serve para outro e-mail.
+  const otpHash = (phone, purpose, code, email = '') => sha256(`${phone}|${purpose}|${code}|${email}`);
+  const normEmail = (e) => {
+    const v = String(e || '').trim().toLowerCase();
+    return v.length <= 254 && /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/.test(v) ? v : null;
+  };
+  const maskEmail = (e) => e.replace(/^(.{1,2})[^@]*(@.*)$/, (m, a, b) => a + '•••' + b);
+
+  async function deliverCode({ code, purpose, phone, email }) {
+    const what = { register: 'criar a sua conta', reset_pin: 'mudar o PIN', email: 'confirmar o seu e-mail' }[purpose];
+    if (email && !mail.sandbox) {
+      const text = `O seu código ${C.APP_NAME} para ${what} é ${code}.\nVálido ${C.OTP_MINUTES} minutos. Nunca o partilhe com ninguém, nem com agentes ou funcionários.\nSe não foi você, ignore esta mensagem.`;
+      const html = `<div style="font-family:system-ui,Arial,sans-serif;max-width:420px;margin:auto;padding:24px;color:#18201b">
+        <h2 style="color:#0f7a3d;margin:0 0 12px">${C.APP_NAME}</h2>
+        <p>O seu código para ${what} é:</p>
+        <p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:12px 0">${code}</p>
+        <p style="color:#5b6660">Válido ${C.OTP_MINUTES} minutos. Nunca o partilhe com ninguém, nem com agentes ou funcionários.<br>Se não foi você, ignore esta mensagem.</p></div>`;
+      const r = await mail.send({ to: email, subject: `${C.APP_NAME}: o seu código é ${code}`, text, html });
+      return { channel: 'email', provider: r.provider };
+    }
+    if (!sms.sandbox) {
+      await sms.send(phone, `${C.APP_NAME}: o seu código é ${code}. Válido ${C.OTP_MINUTES} min. Nunca o partilhe.`);
+      return { channel: 'sms', provider: sms.name };
+    }
+    return { channel: 'sandbox', provider: 'sandbox' };
+  }
+
+  async function issueCode({ phone, purpose, email = '', userId = null }, ip) {
+    const { n } = await db.get('SELECT COUNT(*) AS n FROM otp_codes WHERE phone = ? AND created_at > ?', phone, now() - 3_600_000);
+    if (n >= C.OTP_MAX_PER_HOUR) throw new ApiError(429, 'otp_limit', 'Pediu demasiados códigos. Tente de novo dentro de uma hora.');
+    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    const expires = now() + C.OTP_MINUTES * 60000;
+    const { id } = await db.get('INSERT INTO otp_codes (phone, purpose, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id',
+      phone, purpose, otpHash(phone, purpose, code, email), expires, now());
+    let d;
+    try {
+      d = await deliverCode({ code, purpose, phone, email });
+    } catch (err) {
+      await db.run('UPDATE otp_codes SET used_at = ? WHERE id = ?', now(), id); // não chegou: anula
+      console.error('Envio do código falhou:', err.message);
+      throw new ApiError(503, 'otp_send_failed', 'Não foi possível enviar o código agora. Tente de novo dentro de alguns minutos.');
+    }
+    await audit(userId, 'otp_sent', { purpose, channel: d.channel, provider: d.provider }, ip);
+    return { code, expires, ...d };
+  }
 
   // Envia um código de 6 dígitos. Para recuperar o PIN, a resposta é igual
   // quer o número tenha conta quer não (não revela quem é cliente).
-  async function requestOtp({ phone, country, purpose = 'register' }, ip) {
+  async function requestOtp({ phone, country, purpose = 'register', email }, ip) {
     if (!['register', 'reset_pin'].includes(purpose)) throw new ApiError(400, 'bad_purpose', 'Pedido inválido.');
     const ctry = C.COUNTRIES[country] ? country : 'ST';
     const p = normalizePhone(phone, ctry);
     if (!p) throw new ApiError(400, 'bad_phone', `Número inválido para ${C.COUNTRIES[ctry].name}. Exemplo: ${C.COUNTRIES[ctry].example}.`);
     const exists = await userByPhone(p);
     if (purpose === 'register' && exists) throw new ApiError(409, 'phone_taken', 'Este número já tem conta. Entre com o seu PIN.');
-    const { n } = await db.get('SELECT COUNT(*) AS n FROM otp_codes WHERE phone = ? AND created_at > ?', p, now() - 3_600_000);
-    if (n >= C.OTP_MAX_PER_HOUR) throw new ApiError(429, 'otp_limit', 'Pediu demasiados códigos. Tente de novo dentro de uma hora.');
-    const out = { phone: p, sent: true, expires_at: now() + C.OTP_MINUTES * 60000 };
-    if (purpose === 'reset_pin' && !exists) return out;
-    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
-    await db.run('INSERT INTO otp_codes (phone, purpose, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
-      p, purpose, otpHash(p, purpose, code), out.expires_at, now());
-    await sms.send(p, `${C.APP_NAME}: o seu código é ${code}. Válido ${C.OTP_MINUTES} min. Nunca o partilhe.`);
-    await audit(exists ? exists.id : null, 'otp_sent', { purpose, provider: sms.name }, ip);
-    // Em modo de teste (sem fornecedor de SMS) o código é mostrado no ecrã.
-    return sms.sandbox ? { ...out, dev_code: code } : out;
+    let em = '';
+    if (purpose === 'register' && (email || otpChannel === 'email')) {
+      em = normEmail(email);
+      if (!em) throw new ApiError(400, 'bad_email', 'Indique um e-mail válido: é para lá que enviamos o código.');
+    }
+    const out = { phone: p, sent: true, expires_at: now() + C.OTP_MINUTES * 60000, channel: otpChannel };
+    if (purpose === 'reset_pin') {
+      if (!exists) return out;
+      // Recuperar o PIN: vai para o e-mail guardado na conta (ou SMS, se houver fornecedor).
+      if (otpChannel === 'email' && !exists.email && sms.sandbox) return out;
+      em = otpChannel === 'email' && exists.email ? exists.email : '';
+    }
+    const r = await issueCode({ phone: p, purpose, email: em, userId: exists ? exists.id : null }, ip);
+    const res = { ...out, expires_at: r.expires, channel: r.channel };
+    if (purpose === 'register' && em) res.email = em;
+    // Em modo de teste (sem e-mail nem SMS) o código é mostrado no ecrã.
+    return r.channel === 'sandbox' ? { ...res, dev_code: r.code } : res;
   }
 
-  async function verifyOtp(phone, purpose, code) {
+  // Juntar ou mudar o e-mail no perfil (código enviado para o e-mail novo).
+  async function requestEmailCode(user, { email }, ip) {
+    const em = normEmail(email);
+    if (!em) throw new ApiError(400, 'bad_email', 'Indique um e-mail válido.');
+    if (otpChannel === 'sms') throw new ApiError(409, 'mail_disabled', 'O envio de e-mails ainda não está configurado.');
+    const r = await issueCode({ phone: user.phone, purpose: 'email', email: em, userId: user.id }, ip);
+    const res = { sent: true, email: em, expires_at: r.expires, channel: r.channel };
+    return r.channel === 'sandbox' ? { ...res, dev_code: r.code } : res;
+  }
+
+  async function setEmail(user, { email, code }, ip) {
+    const em = normEmail(email);
+    if (!em) throw new ApiError(400, 'bad_email', 'Indique um e-mail válido.');
+    await verifyOtp(user.phone, 'email', code, em);
+    await db.run('UPDATE users SET email = ? WHERE id = ?', em, user.id);
+    await audit(user.id, 'email_set', { email: maskEmail(em) }, ip);
+    return publicUser(await userById(user.id));
+  }
+
+  async function verifyOtp(phone, purpose, code, email = '') {
     const row = await db.get('SELECT * FROM otp_codes WHERE phone = ? AND purpose = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1', phone, purpose);
     if (!row || row.expires_at < now()) throw new ApiError(400, 'otp_expired', 'O código expirou ou não existe. Peça um novo código.');
     if (row.attempts >= C.OTP_MAX_ATTEMPTS) throw new ApiError(423, 'otp_locked', 'Demasiadas tentativas. Peça um novo código.');
-    if (typeof code !== 'string' || row.code_hash !== otpHash(phone, purpose, code.trim())) {
+    if (typeof code !== 'string' || row.code_hash !== otpHash(phone, purpose, code.trim(), email)) {
       await db.run('UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?', row.id);
       throw new ApiError(401, 'otp_wrong', `Código errado. Restam ${C.OTP_MAX_ATTEMPTS - row.attempts - 1} tentativas.`);
     }
     await db.run('UPDATE otp_codes SET used_at = ? WHERE id = ?', now(), row.id);
   }
 
-  // Esqueci o PIN: código por SMS + PIN novo. Termina as sessões noutros telemóveis.
+  // Esqueci o PIN: código (e-mail da conta ou SMS) + PIN novo. Termina as sessões noutros telemóveis.
   async function resetPin({ phone, country, code, newPin }, ip) {
     const p = normalizePhone(phone, C.COUNTRIES[country] ? country : 'ST');
     if (!p) throw new ApiError(400, 'bad_phone', 'Número inválido.');
@@ -171,7 +244,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     const user = await userByPhone(p);
     if (!user) throw new ApiError(400, 'otp_expired', 'O código expirou ou não existe. Peça um novo código.');
     if (user.status !== 'active') throw new ApiError(403, 'blocked', 'Conta bloqueada. Contacte o apoio ao cliente.');
-    await verifyOtp(p, 'reset_pin', code);
+    await verifyOtp(p, 'reset_pin', code, otpChannel === 'email' && user.email ? user.email : '');
     await db.run('UPDATE users SET pin_hash = ?, failed_pins = 0, locked_until = 0 WHERE id = ?', hashPin(newPin), user.id);
     await db.run('DELETE FROM sessions WHERE user_id = ?', user.id);
     await audit(user.id, 'pin_reset', null, ip);
@@ -179,7 +252,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
   }
 
   // ---------- Contas e sessões ----------
-  async function register({ phone, name, pin, country, code }, ip) {
+  async function register({ phone, name, pin, country, code, email }, ip) {
     const ctry = C.COUNTRIES[country] ? country : null;
     if (!ctry) throw new ApiError(400, 'bad_country', 'Escolha o seu país.');
     const p = normalizePhone(phone, ctry);
@@ -191,14 +264,21 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     const taken = new ApiError(409, 'phone_taken', 'Este número já tem conta. Entre com o seu PIN.');
     if (await userByPhone(p)) throw taken;
     // O código por SMS prova que a pessoa tem mesmo este número.
-    if (otpRequired) await verifyOtp(p, 'register', code);
+    // O código (por e-mail ou SMS) prova que a pessoa tem mesmo este e-mail/número.
+    let em = null;
+    if (email || otpChannel === 'email') {
+      em = normEmail(email);
+      if (!em) throw new ApiError(400, 'bad_email', 'Indique um e-mail válido.');
+    }
+    if (otpRequired) await verifyOtp(p, 'register', code, em || '');
+    if (otpChannel === 'sms' || !otpRequired) em = null; // só se guarda um e-mail confirmado
     const role = p === adminPhoneNorm ? 'admin' : 'user';
     const cur = C.COUNTRIES[realCountry].currency;
     let user;
     try {
       user = await db.tx(async () => {
-        const { id } = await db.get(`INSERT INTO users (phone, country, name, pin_hash, receive_currency, role, created_at)
-                                     VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`, p, realCountry, n, hashPin(pin), cur, role, now());
+        const { id } = await db.get(`INSERT INTO users (phone, country, name, pin_hash, receive_currency, role, email, created_at)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, p, realCountry, n, hashPin(pin), cur, role, em, now());
         await ensureWallet(id, cur);
         return userById(id);
       });
@@ -1355,7 +1435,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
 
   return {
     ...extra,
-    requestOtp, resetPin, payCommission,
+    requestOtp, resetPin, requestEmailCode, setEmail, otpChannel: () => otpChannel, mailStatus: () => ({ channel: otpChannel, providers: mail.providers, status: mail.status() }), payCommission,
     register, login, logout, userFromToken, publicUser, changePin, setReceiveCurrency, lookup,
     quoteTransfer, quoteExchange, quoteRequest, quoteCashIn, quoteCashout,
     transfer, exchange, history, createRequest, listRequests, payRequest, closeRequest,

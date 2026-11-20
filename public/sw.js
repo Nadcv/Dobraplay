@@ -1,6 +1,6 @@
 // Guarda só a "casca" da app para abrir rápido com rede fraca.
 // NUNCA guarda respostas da /api (saldos e movimentos vêm sempre do servidor).
-const CACHE = 'dobrapay-v10';
+const CACHE = 'dobrapay-v11';
 const SHELL = ['/', '/index.html', '/style.css', '/i18n.js', '/app.js', '/manifest.json', '/icon.svg'];
 
 self.addEventListener('install', (e) => {

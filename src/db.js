@@ -22,7 +22,7 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 8; // 8 = ligações automáticas aos bancos (SFTP, e-mail, Open Banking)
+const SCHEMA_VERSION = 9; // 9 = e-mail dos clientes (códigos de verificação por e-mail)
 const _V5 = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
@@ -45,6 +45,7 @@ const SCHEMA = `
     failed_pins       INTEGER NOT NULL DEFAULT 0,
     locked_until      INTEGER NOT NULL DEFAULT 0,
     merchant_name     TEXT,                          -- preenchido = conta de loja (recebe pagamentos com QR)
+    email             TEXT,                          -- verificado com código (registo ou perfil)
     created_at        INTEGER NOT NULL
   );
 
@@ -617,6 +618,10 @@ const MIGRATIONS = {
   },
   7: { postgres: '', sqlite: '' }, // só tabelas novas (criadas acima)
   8: { postgres: '', sqlite: '' }, // só tabelas novas
+  9: {
+    postgres: 'ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;',
+    sqlite: 'ALTER TABLE users ADD COLUMN email TEXT;',
+  },
 };
 
 async function openDb({ url, file } = {}) {

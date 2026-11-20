@@ -163,8 +163,10 @@ function attachLookup(form, field) {
 }
 
 // ---------------- Autenticação ----------------
-// Modos: login, register (2 passos: código por SMS e depois criar a conta) e reset (esqueci o PIN).
+// Modos: login, register (2 passos: código por e-mail/SMS e depois criar a conta) e reset (esqueci o PIN).
 let authMode = 'login';
+// Por onde chegam os códigos: 'email' (Resend/Brevo), 'sms' ou 'sandbox' (modo de teste).
+const otpChannel = () => CFG.otp_channel || 'sandbox';
 let codeSent = false;
 function setAuthMode(mode) {
   authMode = mode; codeSent = false;
@@ -178,7 +180,9 @@ function setAuthMode(mode) {
   $('[data-devcode]', form).hidden = true;
   $('[data-pinlabel]', form).textContent = t(mode === 'reset' ? 'Novo PIN (4 a 6 dígitos)' : 'PIN (4 a 6 dígitos)');
   form.pin.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
-  form.querySelector('button[type=submit]').textContent = t(mode === 'login' ? 'Entrar' : 'Enviar código por SMS');
+  form.querySelector('button[type=submit]').textContent = t(mode === 'login' ? 'Entrar' : { sms: 'Enviar código por SMS', email: 'Enviar código por e-mail' }[otpChannel()] || 'Enviar código');
+  $('[data-codelabel]', form).textContent = t({ sms: 'Código recebido por SMS', email: 'Código recebido por e-mail' }[otpChannel()] || 'Código recebido');
+  form.email.required = mode === 'register' && otpChannel() === 'email';
   $('[data-forgot]', form).hidden = mode !== 'login';
   $('[data-backlogin]', form).hidden = mode !== 'reset';
   $('[data-passkey-login]', form).hidden = mode !== 'login' || !window.PublicKeyCredential;
@@ -222,23 +226,27 @@ $('#authForm').addEventListener('submit', async (e) => {
       return signedIn(r, f.get('country'));
     }
     if (!codeSent) {
-      // Passo 1: pede o código por SMS.
+      // Passo 1: pede o código (por e-mail ou SMS).
       if (authMode === 'register' && !f.get('name')) throw new Error(t('Indique o seu nome completo.'));
-      const o = await api('POST', '/auth/otp', { phone: f.get('phone'), country: f.get('country'), purpose: authMode === 'register' ? 'register' : 'reset_pin' });
+      if (authMode === 'register' && otpChannel() === 'email' && !f.get('email')) throw new Error(t('Indique o seu e-mail: é para lá que enviamos o código.'));
+      const o = await api('POST', '/auth/otp', { phone: f.get('phone'), country: f.get('country'), purpose: authMode === 'register' ? 'register' : 'reset_pin', email: authMode === 'register' ? (f.get('email') || undefined) : undefined });
       codeSent = true;
       form.querySelector('[data-only=code]').hidden = false;
       form.querySelector('[data-only=pin]').hidden = false;
       const dev = $('[data-devcode]', form);
       dev.hidden = !o.dev_code;
-      if (o.dev_code) dev.textContent = t('Modo de teste (sem SMS): o seu código é {code}', { code: o.dev_code });
+      if (o.dev_code) dev.textContent = t('Modo de teste (sem e-mail nem SMS): o seu código é {code}', { code: o.dev_code });
       btn.textContent = t(authMode === 'register' ? 'Criar conta' : 'Guardar novo PIN');
-      toast(t('Enviámos um código por SMS para {phone}.', { phone: prettyPhone(o.phone) }));
+      if (o.dev_code) { /* modo de teste: o código já está no ecrã */ }
+      else if (o.channel === 'sms') toast(t('Enviámos um código por SMS para {phone}.', { phone: prettyPhone(o.phone) }));
+      else if (authMode === 'register') toast(t('Enviámos um código para {email}. Veja também a pasta de spam.', { email: o.email }));
+      else toast(t('Se este número tiver conta com e-mail, enviámos um código para o e-mail registado. Sem e-mail? Peça ajuda a um agente.'));
       form.code.focus();
       return;
     }
     // Passo 2: cria a conta / muda o PIN com o código.
     const r = authMode === 'register'
-      ? await api('POST', '/auth/register', { phone: f.get('phone'), name: f.get('name'), pin: f.get('pin'), country: f.get('country'), code: f.get('code') })
+      ? await api('POST', '/auth/register', { phone: f.get('phone'), name: f.get('name'), email: f.get('email') || undefined, pin: f.get('pin'), country: f.get('country'), code: f.get('code') })
       : await api('POST', '/auth/reset-pin', { phone: f.get('phone'), country: f.get('country'), code: f.get('code'), newPin: f.get('pin') });
     if (authMode === 'reset') toast(t('PIN alterado. Já entrou na sua conta.'));
     signedIn(r, f.get('country'));
@@ -1385,6 +1393,7 @@ const SHEETS = {
     title: 'O meu perfil',
     html: `<div class="summary"><div><span>Nome</span><strong>${esc(state.me.name)}</strong></div>
       <div><span>Número</span><span>${flagOf(state.me.country)} ${esc(prettyPhone(state.me.phone))}</span></div>
+      <div><span>E-mail</span><span data-myemail>${state.me.email ? esc(state.me.email) : '—'}</span></div>
       <div><span>Recebe em</span><span>${esc(state.me.receive_currency)}</span></div>
       <div><span>Conta</span><span>${{ user: 'Cliente', agent: 'Agente', admin: 'Administrador' }[state.me.role]} · nível ${state.me.tier}</span></div></div>
       <div class="toggle-row"><span>🔔 ${t('Notificações')}</span><button type="button" class="btn small" data-push>${t('Ativar')}</button></div>
@@ -1393,6 +1402,12 @@ const SHEETS = {
       <div class="toggle-row"><span>🪪 ${t('Identidade')}: <b data-kycstatus>…</b></span><button type="button" class="btn small" data-go="kyc" data-kycbtn hidden>${t('Verificar')}</button></div>
       <div class="toggle-row"><span>🔁 ${t('Envios automáticos')}</span><button type="button" class="btn small" data-go="scheduled">${t('Ver')}</button></div>
       <div class="toggle-row"><span>🌐 ${t('Idioma')}</span><select data-lang style="width:auto"></select></div>
+      <form data-emailform data-own style="margin-top:14px"><h3 style="font-size:1rem">${t(state.me.email ? 'Mudar e-mail' : 'Juntar e-mail')}</h3>
+      <p class="hint">${t('Serve para receber o código se esquecer o PIN.')}</p>
+      <label>E-mail<input name="email" type="email" inputmode="email" autocomplete="email" maxlength="254" value="${esc(state.me.email || '')}" required></label>
+      <label data-emailcode hidden>${t('Código recebido por e-mail')}<input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" class="code-input"></label>
+      <p class="who" data-emaildev hidden></p>
+      <button class="btn" style="width:100%">${t('Enviar código')}</button></form>
       <form data-myiban data-own style="margin-top:14px"><h3 style="font-size:1rem">O meu IBAN (para levantar)</h3>
       <label>IBAN<input name="iban" autocomplete="off" style="text-transform:uppercase" placeholder="PT50 0000 0000 0000 0000 0000 0"></label>
       <label>Titular<input name="holder" maxlength="80" value="${esc(state.me.name)}"></label>
@@ -1412,6 +1427,34 @@ const SHEETS = {
         e.preventDefault();
         try { await api('POST', '/me/bank-account', { iban: f.iban.value, holder: f.holder.value }); toast(f.iban.value ? 'IBAN guardado.' : 'IBAN apagado.'); }
         catch (err) { toast(err.message, true); }
+      });
+      // E-mail (com código enviado para o e-mail novo)
+      const ef = $('[data-emailform]', root);
+      let emailSentTo = null;
+      ef.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const eb = ef.querySelector('button');
+        eb.disabled = true;
+        try {
+          if (!emailSentTo || emailSentTo !== ef.email.value.trim().toLowerCase()) {
+            const o = await api('POST', '/me/email/code', { email: ef.email.value });
+            emailSentTo = o.email;
+            $('[data-emailcode]', ef).hidden = false;
+            const dev = $('[data-emaildev]', ef);
+            dev.hidden = !o.dev_code;
+            if (o.dev_code) dev.textContent = t('Modo de teste (sem e-mail nem SMS): o seu código é {code}', { code: o.dev_code });
+            else toast(t('Enviámos um código para {email}. Veja também a pasta de spam.', { email: o.email }));
+            eb.textContent = t('Confirmar e-mail');
+            ef.code.focus();
+          } else {
+            state.me = await api('POST', '/me/email', { email: emailSentTo, code: ef.code.value });
+            $('[data-myemail]', root).textContent = state.me.email;
+            $('[data-emailcode]', ef).hidden = true; $('[data-emaildev]', ef).hidden = true;
+            ef.code.value = ''; emailSentTo = null; eb.textContent = t('Enviar código');
+            toast(t('E-mail confirmado ✓'));
+          }
+        } catch (err) { toast(errText(err), true); }
+        finally { eb.disabled = false; }
       });
       fillLangSelect($('[data-lang]', root));
       // Notificações

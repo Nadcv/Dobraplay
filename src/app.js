@@ -97,6 +97,7 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
     fx_spread: C.FX_SPREAD,
     fees: { domestic: 'grátis', international: '1% (mín. 0,50 €, máx. 20 €)', cash_out: '1% (mín. 0,20 €, máx. 8 €)' },
     card_topup: service.cardTopupConfig(),
+    otp_channel: service.otpChannel(), // email / sms / sandbox
   }));
   // Para o alojamento saber se a app está viva (e a base de dados responde).
   api.get('/health', wrap(async () => { await service.listRates(); return { ok: true }; }));
@@ -115,6 +116,8 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
   api.post('/auth/login', ipLimit, authLimit, wrap((req) => service.login(body(req), req.ip)));
   api.post('/auth/logout', auth, wrap(async (req) => { await service.logout(bearer(req)); return { ok: true }; }));
   api.post('/me/pin', auth, rateLimit({ windowMs: 15 * 60000, max: 10 }), wrap(async (req) => { await service.changePin(req.user, body(req), req.ip); return { ok: true }; }));
+  api.post('/me/email/code', auth, rateLimit({ windowMs: 15 * 60000, max: 5 }), wrap((req) => service.requestEmailCode(req.user, body(req), req.ip)));
+  api.post('/me/email', auth, rateLimit({ windowMs: 15 * 60000, max: 10 }), wrap((req) => service.setEmail(req.user, body(req), req.ip)));
   api.post('/me/receive-currency', auth, wrap((req) => service.setReceiveCurrency(req.user, body(req).currency)));
 
   // ----- Cliente -----
@@ -309,6 +312,7 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
 
   // ----- Administração -----
   api.get('/admin/stats', auth, wrap((req) => service.stats(req.user)));
+  api.get('/admin/mail', auth, wrap((req) => { if (req.user.role !== 'admin') throw new ApiError(403, 'forbidden', 'Só para administradores.'); return service.mailStatus(); }));
   api.get('/admin/users', auth, wrap((req) => service.listUsers(req.user, req.query)));
   api.patch('/admin/users/:id', auth, wrap((req) => {
     const b = body(req);
