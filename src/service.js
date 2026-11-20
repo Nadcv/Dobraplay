@@ -1012,21 +1012,24 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     return Promise.all(rows.map((r) => bankRequestView(r, { forAdmin: true })));
   }
 
+  // Credita um carregamento pendente (tem de correr dentro de db.tx()).
+  async function confirmDepositCore(admin, id, amount, bankReference) {
+    const r = await lockedRequest(id, " AND kind = 'deposit'");
+    const received = amount == null ? r.amount : amount;
+    if (!Number.isSafeInteger(received) || received < 1) throw new ApiError(400, 'bad_amount', 'Valor recebido inválido.');
+    const t = await move({ type: 'bank_in', fromAcc: await internal('system_float', r.currency), toAcc: await ensureWallet(r.user_id, r.currency),
+      quote: await buildQuote({ amount: received, from: r.currency, to: r.currency, feeKind: 'bankIn' }),
+      note: `Transferência bancária (${r.reference})`, createdBy: admin.id });
+    await db.run("UPDATE bank_requests SET status = 'completed', amount = ?, bank_reference = ?, tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
+      received, cleanText(bankReference, 80), t, admin.id, now(), r.id);
+    return t;
+  }
+
   // O dinheiro chegou ao banco: credita a carteira com o valor RECEBIDO.
   async function confirmBankDeposit(admin, id, { amount, bankReference, pin }, ip) {
     requireRole(admin, 'admin');
     await checkPin(admin, pin, ip);
-    const txId = await db.tx(async () => {
-      const r = await lockedRequest(id, " AND kind = 'deposit'");
-      const received = amount == null ? r.amount : amount;
-      if (!Number.isSafeInteger(received) || received < 1) throw new ApiError(400, 'bad_amount', 'Valor recebido inválido.');
-      const t = await move({ type: 'bank_in', fromAcc: await internal('system_float', r.currency), toAcc: await ensureWallet(r.user_id, r.currency),
-        quote: await buildQuote({ amount: received, from: r.currency, to: r.currency, feeKind: 'bankIn' }),
-        note: `Transferência bancária (${r.reference})`, createdBy: admin.id });
-      await db.run("UPDATE bank_requests SET status = 'completed', amount = ?, bank_reference = ?, tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
-        received, cleanText(bankReference, 80), t, admin.id, now(), r.id);
-      return t;
-    });
+    const txId = await db.tx(() => confirmDepositCore(admin, id, amount, bankReference));
     afterCommit(txId);
     await audit(admin.id, 'bank_deposit_confirmed', { id, tx: txId }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', txId), { forAdmin: true });
@@ -1343,9 +1346,10 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     checkPin, requireRole, needCurrency, buildQuote, move, recordTx, idempotent, txView, transfer, publicUser,
     limitsFor, sentTodayEur, createCashoutCode, history, OUTGOING, env, pushSender,
     newSessionFor: async (u) => ({ token: await newSession(u.id), user: await publicUser(u) }),
+    confirmDepositCore, finishPayout, lockedRequest, bankAccountView, formatIban: require('./util').formatIban,
   };
   const extra = {};
-  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts', 'cards']) {
+  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts', 'cards', 'statements']) {
     Object.assign(extra, require('./features/' + name)(kit));
   }
 

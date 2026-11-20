@@ -68,6 +68,26 @@ Se um envio **com câmbio** ultrapassar o limite, a app avisa o cliente **antes*
 
 Como cobrir a falta sem pausar envios: agentes que compram float (trazem dinheiro para o banco local), uma reserva inicial da empresa, ou uma linha de crédito do banco parceiro. **Nunca** com o dinheiro de outros clientes.
 
+## Ligação aos bancos por ficheiros (BISTP, CGD…), sem API
+
+Para bancos sem API (como costuma acontecer em São Tomé), a ligação faz-se com os ficheiros do homebanking. No painel de admin, em **Banco**:
+
+**📄 Importar extrato**
+1. Descarregue o extrato da conta da empresa no homebanking e escolha-o na app. Formatos aceites:
+   - **CSV**, incluindo um Excel guardado como CSV, com `;` ou `,`, valores como `1.234,56`, colunas Débito/Crédito ou Valor, e títulos antes do cabeçalho;
+   - **MT940** (SWIFT);
+   - **CAMT.053** (XML ISO 20022).
+   Ficheiros em UTF-8 ou Windows-1252 são lidos com os acentos certos.
+2. A app procura as referências **`DP……`** dos carregamentos e mostra cada entrada como: ✅ corresponde, ⚠️ valor diferente (credita o que realmente chegou), ✓ já tratada, ou sem correspondência.
+3. Reveja e confirme com o PIN. **Cada linha do extrato só pode ser usada uma vez**, mesmo que o mesmo extrato seja importado de novo.
+
+**📦 Pagar em lote**
+1. Escolha a moeda e o formato: **SEPA XML** (`pain.001.001.03`, para euros na CGD e bancos da UE) ou **CSV** (`IBAN;Titular;Valor;Moeda;Descritivo`, para o BISTP e outros).
+2. Carregue o ficheiro no homebanking. Enquanto o lote estiver aberto, os levantamentos incluídos ficam bloqueados: o cliente já não os cancela e não entram noutro lote.
+3. Quando o banco pagar, carregue em **Marcar pago**, com a referência do banco, e todos os pedidos do lote ficam concluídos. Se o banco recusar o ficheiro, **Cancelar** devolve os pedidos ao estado normal.
+
+Quando o BISTP indicar o formato exato do extrato e do ficheiro de pagamentos, a leitura e a exportação podem ser afinadas para esse formato (`src/features/statements.js`).
+
 ## Carregar com cartão (Stripe)
 
 Os clientes carregam a carteira com **Visa, Mastercard, Apple Pay ou Google Pay** através da **Stripe Checkout**:
@@ -145,7 +165,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 39 testes automáticos (SQLite)
+npm test                            # 43 testes automáticos (SQLite)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
@@ -222,7 +242,8 @@ src/app.js         API HTTP + segurança (rate limit, cabeçalhos, webhooks assi
 src/payouts.js     parceiros de pagamento (manual, simulador, API)
 src/features/      sms, push, kyc (identidade), aml (alertas + CSV), passkeys (Face ID),
                    scheduled (envios mensais), bills (recargas/contas), agents (mapa + comissões),
-                   ussd, receipts (comprovativos), cards (carregar com cartão, Stripe)
+                   ussd, receipts (comprovativos), cards (carregar com cartão, Stripe),
+                   statements (importar extratos e pagar em lote: CSV, MT940, CAMT.053, SEPA)
 public/i18n.js     traduções (PT, ES, EN, FR)
 public/            app PWA (instalável no telemóvel)
 tests/             testes automáticos

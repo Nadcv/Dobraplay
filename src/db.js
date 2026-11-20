@@ -22,7 +22,7 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 6; // 6 = SMS, identidade, alertas, push, passkeys, envios automáticos, contas, agentes
+const SCHEMA_VERSION = 7; // 7 = importação de extratos bancários e pagamentos em lote
 const _V5 = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
@@ -377,6 +377,45 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS card_topups_session ON card_topups(session_id);
 
+  -- Extratos bancários importados (ex.: BISTP, CGD) e as suas linhas.
+  CREATE TABLE IF NOT EXISTS statement_imports (
+    id          INTEGER PRIMARY KEY,
+    currency    TEXT NOT NULL,
+    filename    TEXT,
+    format      TEXT NOT NULL,                    -- csv / mt940 / camt053
+    lines_total INTEGER NOT NULL,
+    created_by  INTEGER NOT NULL REFERENCES users(id),
+    created_at  INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS statement_lines (
+    id           INTEGER PRIMARY KEY,
+    import_id    INTEGER NOT NULL REFERENCES statement_imports(id),
+    fingerprint  TEXT NOT NULL,                   -- identifica a linha mesmo que o extrato seja importado de novo
+    booked_at    TEXT,
+    amount       INTEGER NOT NULL,                -- cêntimos; positivo = entrada
+    description  TEXT,
+    reference    TEXT,                            -- referência DP… encontrada (se houver)
+    request_id   INTEGER REFERENCES bank_requests(id),
+    status       TEXT NOT NULL DEFAULT 'preview' CHECK (status IN ('preview','confirmed')),
+    created_at   INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS statement_lines_fp ON statement_lines(fingerprint, status);
+
+  -- Lotes de levantamentos exportados para pagar no homebanking.
+  CREATE TABLE IF NOT EXISTS payout_batches (
+    id              TEXT PRIMARY KEY,
+    currency        TEXT NOT NULL,
+    format          TEXT NOT NULL,                -- csv / sepa
+    request_ids     TEXT NOT NULL,                -- JSON
+    total           INTEGER NOT NULL,
+    count           INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'exported' CHECK (status IN ('exported','paid','cancelled')),
+    bank_reference  TEXT,
+    created_by      INTEGER NOT NULL REFERENCES users(id),
+    created_at      INTEGER NOT NULL,
+    closed_at       INTEGER
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY,
     user_id  INTEGER,
@@ -535,6 +574,7 @@ const MIGRATIONS = {
     `,
     sqlite: null,
   },
+  7: { postgres: '', sqlite: '' }, // só tabelas novas (criadas acima)
 };
 
 async function openDb({ url, file } = {}) {

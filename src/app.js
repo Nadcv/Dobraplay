@@ -36,7 +36,7 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
   const keepRaw = (req, res, buf) => { req.rawBody = buf; };
   const smallJson = express.json({ limit: '20kb', verify: keepRaw });
   const bigJson = express.json({ limit: '2mb', verify: keepRaw });
-  app.use((req, res, next) => (req.path === '/api/me/kyc' ? bigJson : smallJson)(req, res, next));
+  app.use((req, res, next) => (req.path === '/api/me/kyc' || req.path === '/api/admin/statements' ? bigJson : smallJson)(req, res, next));
   // Os gateways USSD enviam formulários (application/x-www-form-urlencoded).
   app.use('/api/ussd', express.urlencoded({ extended: false, limit: '5kb' }));
 
@@ -353,6 +353,18 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
       res.type('text/csv; charset=utf-8').set('Content-Disposition', `attachment; filename="dobrapay-movimentos-${new Date().toISOString().slice(0, 10)}.csv"`).send(csv);
     } catch (e) { next(e); }
   });
+  // Extratos bancários e pagamentos em lote (ligação ao banco por ficheiros).
+  api.post('/admin/statements', auth, wrap((req) => service.previewStatement(req.user,
+    { currency: body(req).currency, content: body(req).content, filename: body(req).filename }, req.ip)));
+  api.post('/admin/statements/:id/confirm', auth, wrap((req) => service.confirmStatement(req.user, req.params.id,
+    { lineIds: body(req).line_ids, pin: body(req).pin }, req.ip)));
+  api.get('/admin/payout-batches', auth, wrap((req) => service.listPayoutBatches(req.user)));
+  api.get('/admin/payout-batches/preview', auth, wrap((req) => service.payoutBatchPreview(req.user, { currency: req.query.currency })));
+  api.post('/admin/payout-batches', auth, wrap((req) => service.exportPayoutBatch(req.user,
+    { currency: body(req).currency, format: body(req).format, pin: body(req).pin }, req.ip)));
+  api.post('/admin/payout-batches/:id/paid', auth, wrap((req) => service.markBatchPaid(req.user, req.params.id,
+    { bankReference: body(req).bank_reference, pin: body(req).pin }, req.ip)));
+  api.post('/admin/payout-batches/:id/cancel', auth, wrap((req) => service.cancelBatch(req.user, req.params.id, { pin: body(req).pin }, req.ip)));
   // Simulador USSD (para mostrar o menu a parceiros sem operadora).
   api.post('/admin/ussd/simulate', auth, wrap(async (req) => {
     if (req.user.role !== 'admin') throw new ApiError(403, 'forbidden', 'Sem permissão para esta operação.');
