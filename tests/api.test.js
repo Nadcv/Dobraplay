@@ -17,6 +17,11 @@ const WEBHOOK_SECRET = 'segredo-de-teste';
 // Stripe falsa: guarda as sessões de pagamento criadas e responde às consultas.
 const stripeMock = { sessions: {}, requests: [], server: null, url: '' };
 const STRIPE_WHSEC = 'whsec_teste';
+// Ligações automáticas aos bancos: pasta local (como uma pasta SFTP), Open Banking falso e e-mail.
+const os = require('os'), fsx = require('fs'), pathx = require('path');
+const BANK_DIR = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'dobrapay-banco-'));
+const obMock = { transactions: [], server: null, url: '', auth: null };
+const EMAIL_TOKEN = 'tok-email-secreto-123';
 
 // Por omissão os testes usam SQLite em memória. Com TEST_DATABASE_URL correm
 // contra PostgreSQL (a base de dados é APAGADA: use uma base só de testes).
@@ -60,9 +65,22 @@ test.before(async () => {
   }).listen(0);
   await new Promise((r) => stripeMock.server.once('listening', r));
   stripeMock.url = `http://127.0.0.1:${stripeMock.server.address().port}`;
+  obMock.server = http.createServer((req, res) => {
+    obMock.auth = req.headers.authorization;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ transactions: obMock.transactions }));
+  }).listen(0);
+  await new Promise((r) => obMock.server.once('listening', r));
+  obMock.url = `http://127.0.0.1:${obMock.server.address().port}/conta/movimentos`;
   db = await openDb(PG_URL ? { url: PG_URL } : { file: ':memory:' });
   service = createService(db, {
-    adminPhone: ADMIN, sandboxDelayMs: 100, env: { PAYOUT_HTTP_URL: partner.url, PAYOUT_HTTP_TOKEN: 'token-parceiro', STRIPE_SECRET_KEY: 'sk_test_123', STRIPE_WEBHOOK_SECRET: STRIPE_WHSEC, STRIPE_API_BASE: stripeMock.url },
+    adminPhone: ADMIN, sandboxDelayMs: 100, env: { PAYOUT_HTTP_URL: partner.url, PAYOUT_HTTP_TOKEN: 'token-parceiro', STRIPE_SECRET_KEY: 'sk_test_123', STRIPE_WEBHOOK_SECRET: STRIPE_WHSEC, STRIPE_API_BASE: stripeMock.url,
+      BANK_DIR_EUR: BANK_DIR, OB_EUR_URL: obMock.url, OB_EUR_TOKEN: 'tok-ob', OB_STN_PROVIDER: 'sandbox',
+      BANK_EMAIL_TOKEN: EMAIL_TOKEN, BANK_EMAIL_SENDERS: '@bistp.st,alertas@cgd.pt', BANK_EMAIL_CURRENCY: 'STN', BANK_EMAIL_AUTO: 'true',
+      // SFTP real (opcional): TEST_SFTP_URL=sftp://banco@127.0.0.1:2222 TEST_SFTP_KEY=… TEST_SFTP_HOSTKEY=SHA256:…
+      ...(process.env.TEST_SFTP_URL ? { BANK_SFTP_AOA: process.env.TEST_SFTP_URL, BANK_SFTP_AOA_KEY: process.env.TEST_SFTP_KEY,
+        BANK_SFTP_AOA_HOSTKEY: process.env.TEST_SFTP_HOSTKEY, BANK_SFTP_AOA_INBOX: process.env.TEST_SFTP_INBOX || '/home/banco/extratos',
+        BANK_SFTP_AOA_OUTBOX: process.env.TEST_SFTP_OUTBOX || '/home/banco/pagamentos' } : {}) },
     pushSender: async (sub, payload, userId) => {
       if (sub.endpoint.includes('expirado')) throw Object.assign(new Error('gone'), { statusCode: 410 });
       pushes.push({ userId, endpoint: sub.endpoint, ...JSON.parse(payload) });
@@ -72,7 +90,7 @@ test.before(async () => {
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}/api`;
 });
-test.after(async () => { server.close(); partner.server.close(); stripeMock.server.close(); await db.close(); });
+test.after(async () => { server.close(); partner.server.close(); stripeMock.server.close(); obMock.server.close(); fsx.rmSync(BANK_DIR, { recursive: true, force: true }); await db.close(); });
 
 async function call(method, path, body, token) {
   const res = await fetch(base + path, {
@@ -1011,6 +1029,118 @@ test('pagar em lote em Dobras (CSV para o BISTP); cancelar o lote devolve os ped
   assert.equal(cancel.body.status, 'cancelled');
   const back = await call('POST', `/bank/requests/${w.id}/cancel`, null, ana.token); // o cliente já pode cancelar
   assert.equal(back.body.status, 'cancelled');
+});
+
+// ---------------- Ligações automáticas aos bancos ----------------
+const syncRun = async (only) => (await call('POST', '/admin/bank-sync/run', { only }, admin.token)).body;
+
+test('pasta do banco (como SFTP): lê extratos novos sozinho, confirma os exatos, não relê, envia os lotes', async () => {
+  const d = (await call('POST', '/bank/deposits', { amount: '33,33', currency: 'EUR' }, maria.token)).body;
+  fsx.mkdirSync(pathx.join(BANK_DIR, 'extratos'), { recursive: true });
+  fsx.writeFileSync(pathx.join(BANK_DIR, 'extratos', 'extrato-20261120.csv'),
+    `Data;Descritivo;Crédito;Débito\n20/11/2026;TRF SEPA MARIA ${d.reference};33,33;\n20/11/2026;OUTRA ENTRADA;10,00;`);
+  fsx.writeFileSync(pathx.join(BANK_DIR, 'extratos', 'leia-me.pdf'), 'não é extrato'); // ignorado
+  const before = await bal(maria.token, 'EUR');
+  const r = (await syncRun('files')).find((x) => x.source === 'folder' && x.currency === 'EUR');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual([r.files, r.credits, r.confirmed], [1, 2, 1]);
+  assert.equal(await bal(maria.token, 'EUR'), before + 3_333);
+  assert.equal((await syncRun('files')).find((x) => x.source === 'folder').files, 0); // já lido: não volta a ler
+  // Valor diferente: fica para o admin rever.
+  const d2 = (await call('POST', '/bank/deposits', { amount: '40', currency: 'EUR' }, maria.token)).body;
+  fsx.writeFileSync(pathx.join(BANK_DIR, 'extratos', 'extrato-20261121.csv'), `Data;Descritivo;Valor\n21/11/2026;TRF ${d2.reference};39,50`);
+  const r2 = (await syncRun('files')).find((x) => x.source === 'folder');
+  assert.deepEqual([r2.files, r2.confirmed, r2.to_review], [1, 0, 1]);
+  const st = (await call('GET', '/admin/bank-sync', null, admin.token)).body;
+  assert.ok(st.connections.some((c) => c.kind === 'folder' && c.currency === 'EUR' && c.last.ok));
+  const rev = st.review.find((x) => x.reference === d2.reference);
+  assert.deepEqual([rev.amount, rev.expected], [3_950, 4_000]);
+  const c = await call('POST', `/admin/statements/${rev.import_id}/confirm`, { line_ids: [rev.line_id], pin: '2580' }, admin.token);
+  assert.equal(c.body.confirmed, 1);
+  // Os ficheiros de lote vão sozinhos para a pasta de saída do banco.
+  await call('POST', '/bank/withdrawals', { amount: '5', currency: 'EUR', iban: IBAN_MARIA, pin: '2580' }, maria.token);
+  const b = (await call('POST', '/admin/payout-batches', { currency: 'EUR', format: 'sepa', pin: '2580' }, admin.token)).body;
+  assert.equal(b.uploaded.target, 'folder');
+  assert.ok(fsx.existsSync(pathx.join(BANK_DIR, 'pagamentos', b.filename)));
+  await call('POST', `/admin/payout-batches/${b.batch_id}/cancel`, { pin: '2580' }, admin.token);
+});
+
+test('Open Banking: lê os movimentos da conta (HTTP normalizado ou simulador), confirma e não repete', async () => {
+  const d = (await call('POST', '/bank/deposits', { amount: '61', currency: 'EUR' }, maria.token)).body;
+  obMock.transactions = [
+    { id: 'tx-001', booking_date: '2026-11-20', amount: '61.00', currency: 'EUR', description: `SEPA CREDIT MARIA ESPANHA ${d.reference}` },
+    { id: 'tx-002', booking_date: '2026-11-20', amount: '-12.00', currency: 'EUR', description: 'PAGAMENTO' },
+  ];
+  const before = await bal(maria.token, 'EUR');
+  const r = (await syncRun('openbanking')).find((x) => x.source === 'openbanking' && x.currency === 'EUR');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.confirmed, 1);
+  assert.equal(obMock.auth, 'Bearer tok-ob');
+  assert.equal(await bal(maria.token, 'EUR'), before + 6_100);
+  assert.equal((await syncRun('openbanking')).find((x) => x.currency === 'EUR').confirmed, 0); // o mesmo movimento não credita duas vezes
+  // Simulador (STN): o admin cria um "movimento do banco" de teste.
+  const ds = (await call('POST', '/bank/deposits', { amount: '250', currency: 'STN' }, ana.token)).body;
+  assert.equal((await call('POST', '/admin/bank-sync/sandbox', { currency: 'EUR', amount: '1', pin: '2580' }, admin.token)).body.error, 'not_sandbox');
+  await call('POST', '/admin/bank-sync/sandbox', { currency: 'STN', amount: '250', description: `TRF ${ds.reference}`, pin: '2580' }, admin.token);
+  const anaBefore = await bal(ana.token, 'STN');
+  assert.equal((await syncRun('openbanking')).find((x) => x.currency === 'STN').confirmed, 1);
+  assert.equal(await bal(ana.token, 'STN'), anaBefore + 25_000);
+});
+
+test('alertas por e-mail: só remetentes do banco; com DKIM confirma sozinho; sem DKIM sugere ao admin', async () => {
+  const send = async (payload, { token = EMAIL_TOKEN, form = false } = {}) => {
+    const opts = form
+      ? { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(payload) }
+      : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) };
+    const res = await fetch(`${base}/webhooks/bank-email/${token}`, opts);
+    return { status: res.status, body: await res.json() };
+  };
+  const d = (await call('POST', '/bank/deposits', { amount: '150', currency: 'STN' }, ana.token)).body;
+  const text = `Caro cliente, foi creditada na sua conta a quantia de 150,00 STN. Descritivo: TRF ANA COSTA ${d.reference}. BISTP`;
+  assert.equal((await send({ from: 'alertas@bistp.st', subject: 'Movimento', text }, { token: 'errado' })).status, 404);
+  assert.equal((await send({ from: 'Falso <banco@bistp-st.com>', subject: 'Movimento', text, dkim: 'pass' })).body.status, 'rejected');
+  // Formato SendGrid (formulário/multipart) com DKIM válido do domínio do banco → confirma sozinho.
+  const before = await bal(ana.token, 'STN');
+  const ok = await send({ from: 'BISTP Alertas <alertas@bistp.st>', subject: 'Aviso de movimento', text, dkim: '{@bistp.st : pass}' }, { form: true });
+  assert.equal(ok.body.status, 'confirmed', JSON.stringify(ok.body));
+  assert.equal(await bal(ana.token, 'STN'), before + 15_000);
+  assert.equal((await send({ from: 'BISTP Alertas <alertas@bistp.st>', subject: 'Aviso de movimento', text, dkim: '{@bistp.st : pass}' }, { form: true })).body.duplicate, true);
+  // Sem DKIM (ex.: formato Postmark sem assinatura): só sugere; o admin confirma com o PIN.
+  const d2 = (await call('POST', '/bank/deposits', { amount: '1200', currency: 'STN' }, bruno.token)).body;
+  const sug = await send({ From: 'alertas@bistp.st', Subject: `Crédito ${d2.reference}`, TextBody: 'Montante: 1 200,00 STN', MessageID: 'msg-777' });
+  assert.equal(sug.body.status, 'suggested');
+  const st = (await call('GET', '/admin/bank-sync', null, admin.token)).body;
+  assert.equal(st.email.enabled, true);
+  assert.equal(st.email.path, `/api/webhooks/bank-email/${EMAIL_TOKEN}`);
+  const alert = st.email_alerts.find((a) => a.reference === d2.reference);
+  assert.deepEqual([alert.amount, alert.dkim_ok], [120_000, false]);
+  const brunoBefore = await bal(bruno.token, 'STN');
+  await call('POST', `/admin/bank-sync/email/${alert.id}/confirm`, { pin: '2580' }, admin.token);
+  assert.equal(await bal(bruno.token, 'STN'), brunoBefore + 120_000);
+  // Valor diferente do pedido: não credita, fica registado com o motivo.
+  const d3 = (await call('POST', '/bank/deposits', { amount: '80', currency: 'STN' }, ana.token)).body;
+  const bad = await send({ from: 'alertas@bistp.st', subject: 'Movimento', text: `Crédito de 8,00 STN ${d3.reference}`, dkim: 'pass' });
+  assert.equal(bad.body.status, 'unmatched');
+  const st2 = (await call('GET', '/admin/bank-sync', null, admin.token)).body;
+  assert.match(st2.email_alerts.find((a) => a.reference === d3.reference).note, /valor no e-mail diferente/);
+});
+
+test('SFTP real com o banco: verifica a identidade do servidor e lê os extratos', { skip: !process.env.TEST_SFTP_URL && 'sem servidor SFTP de teste (TEST_SFTP_URL)' }, async () => {
+  const joao2 = await register('944000111', 'Joana Luanda', 'AO');
+  await call('POST', '/admin/bank/accounts', { currency: 'AOA', bank_name: 'Banco AO', holder: 'DobraPay Angola', iban: 'AO06004400006729503010102', pin: '2580' }, admin.token);
+  const d = (await call('POST', '/bank/deposits', { amount: '25000', currency: 'AOA' }, joao2.token)).body;
+  assert.equal(d.status, 'pending', JSON.stringify(d));
+  // O "banco" deixa o extrato na pasta SFTP (a ligação fecha sempre, mesmo se algo falhar).
+  const Client = require('ssh2-sftp-client');
+  const up = new Client();
+  try {
+    await up.connect({ host: new URL(process.env.TEST_SFTP_URL).hostname, port: Number(new URL(process.env.TEST_SFTP_URL).port), username: 'banco', privateKey: process.env.TEST_SFTP_KEY });
+    await up.put(Buffer.from(`Data;Descritivo;Valor\n20/11/2026;TRANSF ${d.reference};25.000,00`), `${process.env.TEST_SFTP_INBOX || '/home/banco/extratos'}/extrato-aoa.csv`);
+  } finally { await up.end().catch(() => {}); }
+  const r = (await syncRun('files')).find((x) => x.source === 'sftp' && x.currency === 'AOA');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.confirmed, 1);
+  assert.equal(await bal(joao2.token, 'AOA'), 2_500_000);
 });
 
 test('livro-razão: em cada moeda a soma de todos os saldos é zero', async () => {

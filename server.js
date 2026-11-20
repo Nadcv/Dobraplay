@@ -18,6 +18,7 @@ async function main() {
   const service = createService(db, { adminPhone: process.env.ADMIN_PHONE, sandboxDelayMs: Number(process.env.PAYOUT_SANDBOX_DELAY_MS) || 5000 });
   const app = createApp(service);
   service.startScheduler(); // envios automáticos mensais (verifica de minuto a minuto)
+  service.startBankSync(); // ligações automáticas aos bancos (SFTP / Open Banking), se configuradas
 
   const check = await service.ledgerCheck();
   if (!check.ok) console.error('⚠️  ATENÇÃO: o livro-razão não bate certo!', check);

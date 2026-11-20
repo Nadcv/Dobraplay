@@ -22,7 +22,7 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 7; // 7 = importação de extratos bancários e pagamentos em lote
+const SCHEMA_VERSION = 8; // 8 = ligações automáticas aos bancos (SFTP, e-mail, Open Banking)
 const _V5 = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
@@ -416,6 +416,47 @@ const SCHEMA = `
     closed_at       INTEGER
   );
 
+  -- Ligações automáticas aos bancos: execuções, ficheiros já lidos e alertas por e-mail.
+  CREATE TABLE IF NOT EXISTS bank_sync_runs (
+    id          INTEGER PRIMARY KEY,
+    source      TEXT NOT NULL,                    -- sftp / folder / openbanking / email
+    currency    TEXT NOT NULL,
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER,
+    ok          INTEGER NOT NULL DEFAULT 0,
+    files       INTEGER NOT NULL DEFAULT 0,
+    credits     INTEGER NOT NULL DEFAULT 0,
+    confirmed   INTEGER NOT NULL DEFAULT 0,
+    to_review   INTEGER NOT NULL DEFAULT 0,
+    error       TEXT
+  );
+  CREATE INDEX IF NOT EXISTS bank_sync_runs_src ON bank_sync_runs(source, currency, started_at);
+  CREATE TABLE IF NOT EXISTS bank_files (
+    fingerprint  TEXT PRIMARY KEY,                -- origem + nome + tamanho + data do ficheiro
+    source       TEXT NOT NULL,
+    currency     TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    import_id    INTEGER REFERENCES statement_imports(id),
+    processed_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS bank_email_alerts (
+    id           INTEGER PRIMARY KEY,
+    dedup        TEXT NOT NULL UNIQUE,
+    received_at  INTEGER NOT NULL,
+    sender       TEXT,
+    subject      TEXT,
+    excerpt      TEXT,
+    dkim_ok      INTEGER NOT NULL DEFAULT 0,
+    currency     TEXT NOT NULL,
+    amount       INTEGER,
+    reference    TEXT,
+    request_id   INTEGER REFERENCES bank_requests(id),
+    status       TEXT NOT NULL CHECK (status IN ('confirmed','suggested','unmatched','dismissed','rejected')),
+    note         TEXT,
+    handled_by   INTEGER REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS bank_email_status ON bank_email_alerts(status, received_at);
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY,
     user_id  INTEGER,
@@ -575,6 +616,7 @@ const MIGRATIONS = {
     sqlite: null,
   },
   7: { postgres: '', sqlite: '' }, // só tabelas novas (criadas acima)
+  8: { postgres: '', sqlite: '' }, // só tabelas novas
 };
 
 async function openDb({ url, file } = {}) {
