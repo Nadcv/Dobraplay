@@ -35,3 +35,8 @@ services:
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
+      # Alertas de movimento por e-mail: segredo do endereço (gerado pelo Render) e remetentes do banco.
+      - key: BANK_EMAIL_TOKEN
+        generateValue: true
+      - key: BANK_EMAIL_SENDERS
+        sync: false

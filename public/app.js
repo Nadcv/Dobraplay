@@ -817,7 +817,7 @@ const SHEETS = {
   // ---------- Admin: banco ----------
   bankAdmin: () => ({
     title: 'Transferências bancárias',
-    html: `<div class="row" style="margin-bottom:12px"><button type="button" class="btn small" data-go="statementImport">📄 Importar extrato</button><button type="button" class="btn small" data-go="payoutBatch">📦 Pagar em lote</button></div>
+    html: `<div class="row" style="margin-bottom:12px"><button type="button" class="btn small" data-go="statementImport">📄 Importar extrato</button><button type="button" class="btn small" data-go="payoutBatch">📦 Pagar em lote</button><button type="button" class="btn small" data-go="bankSync">🔌 Ligações</button></div>
       <label>O seu PIN (para confirmar operações)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label>
       <div data-reqs><p class="hint">A carregar…</p></div>`,
     setup: async (root) => {
@@ -1175,6 +1175,71 @@ const SHEETS = {
       toast(`Lote ${r.batch_id}: ${r.count} pagamentos (${money(r.total, f.get('currency'))}). Carregue o ficheiro no homebanking.`);
       form.pin.value = '';
       form._reload();
+    },
+  }),
+
+
+  // ---------- Admin: ligações automáticas aos bancos ----------
+  bankSync: () => ({
+    title: 'Ligações automáticas aos bancos',
+    html: `<div data-st><p class="hint">A carregar…</p></div>`,
+    setup: async (root) => {
+      const KIND = { sftp: '🔐 SFTP', folder: '📁 Pasta', openbanking: '🏦 Open Banking' };
+      const ago = (t) => (t ? when(t) : 'nunca');
+      const render = (st) => {
+        const conns = st.connections.map((c) => `<div class="req-card"><div class="copy-row"><div><strong>${KIND[c.kind] || c.kind} · ${esc(c.currency)}</strong>
+            <small>${esc(c.target)}${c.kind === 'sftp' && !c.secure ? ' · ⚠️ falta a impressão digital do servidor' : ''}</small>
+            <small>Última verificação: ${esc(ago(c.last && c.last.started_at))}${c.last ? (c.last.ok ? ` · ✓ ${c.last.files ? c.last.files + ' ficheiros · ' : ''}${c.last.confirmed} confirmados${c.last.to_review ? ' · ' + c.last.to_review + ' por rever' : ''}` : ` · ❌ ${esc(c.last.error || '')}`) : ''}</small>
+            ${c.last && c.last.ok && c.last.error ? `<small style="color:var(--red)">${esc(c.last.error)}</small>` : ''}</div>
+            ${c.sandbox ? `<button type="button" class="btn small" data-sbx="${esc(c.currency)}">+ Movimento de teste</button>` : ''}</div></div>`).join('')
+          || '<p class="hint">Nenhuma ligação SFTP, pasta ou Open Banking configurada. Veja a secção "Ligações automáticas aos bancos" do README (variáveis no Render).</p>';
+        const em = st.email.enabled
+          ? `<div class="req-card"><strong>✉️ Alertas por e-mail</strong><br><small>Moeda: ${esc(st.email.currency)} · remetentes: ${esc(st.email.senders.join(', ') || '— nenhum configurado —')} · ${st.email.auto ? 'confirma sozinho (com DKIM)' : 'só sugere ao admin'}</small>
+             <br><small>Endereço para o serviço de e-mail reencaminhar:</small>${copyRow('Webhook', location.origin + st.email.path)}</div>`
+          : '<p class="hint">Alertas por e-mail desativados (falta BANK_EMAIL_TOKEN).</p>';
+        const alerts = st.email_alerts.map((a) => `<div class="req-card" data-alert="${a.id}"><div class="copy-row"><div>
+            <strong>${a.amount ? esc(money(a.amount, a.currency)) : '—'} ${a.reference ? '· ' + esc(a.reference) : ''}</strong>
+            <small>${esc(a.sender || '')} · ${esc(when(a.received_at))} · ${a.dkim_ok ? 'DKIM ✓' : 'sem DKIM'}${a.note ? ' · ' + esc(a.note) : ''}</small>
+            <small>${esc((a.subject || '') + ' — ' + (a.excerpt || '')).slice(0, 160)}</small></div>
+            <span class="tag ${a.status === 'suggested' ? 'pending' : 'rejected'}">${{ suggested: 'Sugerido', unmatched: 'Sem correspondência', rejected: 'Recusado' }[a.status] || a.status}</span></div>
+            <div class="row" style="margin-top:8px">${a.status === 'suggested' ? '<button type="button" class="btn small primary" data-ok-alert style="width:auto">Confirmar carregamento</button>' : ''}<button type="button" class="btn small" data-dismiss>Arquivar</button></div></div>`).join('');
+        const review = st.review.map((r) => `<div class="req-card" data-imp="${r.import_id}" data-line="${r.line_id}"><strong>${esc(money(r.amount, ''))} recebidos · pedido de ${esc(money(r.expected, ''))}</strong>
+            <small>${esc(r.reference || '')} · ${esc(r.user.name)} · ${esc(r.date || '')} · ${esc(r.description || '')}</small>
+            <button type="button" class="btn small primary" data-ok-line style="width:auto;margin-top:8px">Creditar o valor recebido</button></div>`).join('');
+        $('[data-st]', root).innerHTML = `<div class="row" style="margin-bottom:12px"><button type="button" class="btn small primary" data-run style="width:auto">↻ Verificar agora</button></div>
+          ${conns}${em}
+          <label>O seu PIN (para confirmar)<input data-adminpin type="password" inputmode="numeric" maxlength="6"></label>
+          ${alerts ? '<h3 style="font-size:1rem">Alertas por e-mail a tratar</h3>' + alerts : ''}
+          ${review ? '<h3 style="font-size:1rem">Entradas com valor diferente (por rever)</h3>' + review : ''}
+          ${!alerts && !review ? '<p class="who">Nada por rever. ✓</p>' : ''}`;
+        bindCopy(root);
+        const pin = () => $('[data-adminpin]', root).value;
+        const act = async (fn, msg) => { try { await fn(); toast(msg); load(); refresh(); } catch (err) { toast(err.message, true); } };
+        $('[data-run]', root).addEventListener('click', async () => {
+          try {
+            const r = await api('POST', '/admin/bank-sync/run', {});
+            const ok = r.reduce((n, x) => n + (x.confirmed || 0), 0);
+            await load(); refresh();
+            toast(`${r.length} ligações verificadas · ${ok} carregamentos confirmados${r.some((x) => !x.ok) ? ' · houve erros (ver acima)' : ''}`, r.some((x) => !x.ok));
+          } catch (err) { toast(err.message, true); }
+        });
+        root.querySelectorAll('[data-sbx]').forEach((b) => b.addEventListener('click', () => {
+          const amount = prompt(`Valor do movimento de teste (${b.dataset.sbx}):`); if (!amount) return;
+          const description = prompt('Descritivo (inclua a referência DP… do carregamento):') || '';
+          act(() => api('POST', '/admin/bank-sync/sandbox', { currency: b.dataset.sbx, amount, description, pin: pin() }), 'Movimento de teste criado. Carregue em "Verificar agora".');
+        }));
+        root.querySelectorAll('[data-alert]').forEach((card) => {
+          const ok = $('[data-ok-alert]', card);
+          if (ok) ok.addEventListener('click', () => act(() => api('POST', `/admin/bank-sync/email/${card.dataset.alert}/confirm`, { pin: pin() }), 'Carregamento confirmado.'));
+          $('[data-dismiss]', card).addEventListener('click', () => act(() => api('POST', `/admin/bank-sync/email/${card.dataset.alert}/dismiss`), 'Alerta arquivado.'));
+        });
+        root.querySelectorAll('[data-ok-line]').forEach((b) => b.addEventListener('click', () => {
+          const card = b.closest('[data-line]');
+          act(() => api('POST', `/admin/statements/${card.dataset.imp}/confirm`, { line_ids: [Number(card.dataset.line)], pin: pin() }), 'Valor recebido creditado.');
+        }));
+      };
+      const load = async () => render(await api('GET', '/admin/bank-sync'));
+      await load();
     },
   }),
 

@@ -1349,7 +1349,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     confirmDepositCore, finishPayout, lockedRequest, bankAccountView, formatIban: require('./util').formatIban,
   };
   const extra = {};
-  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts', 'cards', 'statements']) {
+  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts', 'cards', 'statements', 'banksync']) {
     Object.assign(extra, require('./features/' + name)(kit));
   }
 

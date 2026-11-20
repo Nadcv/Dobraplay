@@ -208,11 +208,10 @@ module.exports = function statements(kit) {
   const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
   // ---------- 1. Importar extrato ----------
-  async function previewStatement(admin, { currency, content, filename }, ip) {
-    requireRole(admin, 'admin');
-    kit.needCurrency(currency);
-    if (typeof content !== 'string' || content.length > 1_500_000) throw new ApiError(400, 'bad_statement', 'Ficheiro inválido ou demasiado grande.');
-    const { format, lines } = parseStatement(content);
+  // Recebe linhas de um extrato (de um ficheiro, SFTP, Open Banking…), regista-as e
+  // classifica cada entrada. Com autoConfirm, confirma logo as que correspondem
+  // exatamente (referência + valor); as outras ficam para o admin rever.
+  async function ingestLines(admin, { currency, format, filename, lines, autoConfirm = false, idOf }) {
     const { id: importId } = await db.get('INSERT INTO statement_imports (currency, filename, format, lines_total, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
       currency, cleanText(filename, 120), format, lines.length, admin.id, now());
     const seen = {};
@@ -221,8 +220,9 @@ module.exports = function statements(kit) {
       if (l.amount <= 0) continue; // só as entradas interessam para os carregamentos
       const base = `${currency}|${l.date}|${l.amount}|${norm(l.description)}`;
       seen[base] = (seen[base] || 0) + 1; // duas linhas iguais no mesmo extrato são movimentos diferentes
-      const fingerprint = sha(`${base}|${seen[base]}`);
-      const refs = [...new Set(((l.description + ' ' + l.raw).toUpperCase().match(REF_RE) || []))];
+      // Se a origem tem um identificador estável (ex.: Open Banking), usa-o.
+      const fingerprint = sha(idOf && idOf(l) ? `id|${currency}|${idOf(l)}` : `${base}|${seen[base]}`);
+      const refs = [...new Set(((l.description + ' ' + (l.raw || '')).toUpperCase().match(REF_RE) || []))];
       const done = await db.get("SELECT request_id FROM statement_lines WHERE fingerprint = ? AND status = 'confirmed' LIMIT 1", fingerprint);
       let state = 'unmatched', req = null;
       if (done) state = 'already';
@@ -241,18 +241,32 @@ module.exports = function statements(kit) {
       rows.push({ line_id: id, date: l.date, amount: l.amount, description: cleanText(l.description, 300), reference: refs[0] || null, state,
         expected: req ? req.amount : null, user });
     }
-    await audit(admin.id, 'statement_preview', { importId, format, credits: rows.length }, ip);
-    const count = (s) => rows.filter((r) => r.state === s).length;
-    return { import_id: importId, format, currency, rows,
+    let confirmed = 0;
+    if (autoConfirm) {
+      const exact = rows.filter((r) => r.state === 'match').map((r) => r.line_id);
+      if (exact.length) confirmed = (await confirmLines(admin, importId, exact)).filter((r) => r.ok).length;
+      for (const r of rows) if (r.state === 'match') r.state = 'confirmed';
+    }
+    const count = (st) => rows.filter((r) => r.state === st).length;
+    return { import_id: importId, format, currency, rows, confirmed,
       summary: { credits: rows.length, match: count('match'), amount_differs: count('amount_differs'), already: count('already'),
-        unmatched: rows.length - count('match') - count('amount_differs') - count('already') } };
+        unmatched: rows.length - count('match') - count('amount_differs') - count('already') - count('confirmed') } };
+  }
+  kit.ingestLines = ingestLines;
+
+  async function previewStatement(admin, { currency, content, filename }, ip) {
+    requireRole(admin, 'admin');
+    kit.needCurrency(currency);
+    if (typeof content !== 'string' || content.length > 1_500_000) throw new ApiError(400, 'bad_statement', 'Ficheiro inválido ou demasiado grande.');
+    const { format, lines } = parseStatement(content);
+    const out = await ingestLines(admin, { currency, format, filename, lines });
+    await audit(admin.id, 'statement_preview', { importId: out.import_id, format, credits: out.rows.length }, ip);
+    delete out.confirmed;
+    return out;
   }
 
-  // Confirma as linhas escolhidas: credita o valor que REALMENTE chegou ao banco.
-  async function confirmStatement(admin, importId, { lineIds, pin }, ip) {
-    requireRole(admin, 'admin');
-    if (!Array.isArray(lineIds) || !lineIds.length) throw new ApiError(400, 'nothing_selected', 'Escolha pelo menos uma linha.');
-    await kit.checkPin(admin, pin, ip);
+  // Confirma linhas do extrato: credita o valor que REALMENTE chegou ao banco.
+  async function confirmLines(admin, importId, lineIds) {
     const results = [];
     for (const lineId of lineIds.slice(0, 500)) {
       try {
@@ -272,6 +286,14 @@ module.exports = function statements(kit) {
         results.push({ line_id: Number(lineId), ok: false, error: err.message });
       }
     }
+    return results;
+  }
+
+  async function confirmStatement(admin, importId, { lineIds, pin }, ip) {
+    requireRole(admin, 'admin');
+    if (!Array.isArray(lineIds) || !lineIds.length) throw new ApiError(400, 'nothing_selected', 'Escolha pelo menos uma linha.');
+    await kit.checkPin(admin, pin, ip);
+    const results = await confirmLines(admin, importId, lineIds);
     await audit(admin.id, 'statement_confirmed', { importId, ok: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length }, ip);
     return { confirmed: results.filter((r) => r.ok).length, results };
   }
@@ -319,7 +341,8 @@ module.exports = function statements(kit) {
       filename = `${batchId}.csv`; mime = 'text/csv';
     }
     await audit(admin.id, 'payout_batch_exported', { batchId, count: items.length, format }, ip);
-    return { batch_id: batchId, count: items.length, total: items.reduce((s, r) => s + r.amount, 0), filename, mime, content };
+    const uploaded = kit.uploadBatchFile ? await kit.uploadBatchFile(currency, filename, content) : null;
+    return { uploaded, batch_id: batchId, count: items.length, total: items.reduce((s, r) => s + r.amount, 0), filename, mime, content };
   }
 
   async function listPayoutBatches(admin) {

@@ -88,6 +88,23 @@ Para bancos sem API (como costuma acontecer em São Tomé), a ligação faz-se c
 
 Quando o BISTP indicar o formato exato do extrato e do ficheiro de pagamentos, a leitura e a exportação podem ser afinadas para esse formato (`src/features/statements.js`).
 
+## Ligações automáticas aos bancos
+
+Três canais, além dos ficheiros carregados à mão. Todos usam a mesma correspondência das referências `DP……`: **as entradas que correspondem exatamente (referência + valor) são confirmadas sozinhas**, e as outras ficam para o admin rever em **Banco → 🔌 Ligações**. Nenhuma entrada é creditada duas vezes, mesmo que chegue por dois canais.
+
+| Canal | Para quê | Configuração (variáveis no Render) |
+|---|---|---|
+| **🔐 SFTP** (*host-to-host*) | O banco deixa os extratos numa pasta segura. A app vai buscá-los de hora a hora e envia para lá os ficheiros de pagamentos em lote. | `BANK_SFTP_STN=sftp://utilizador@servidor:22` · `BANK_SFTP_STN_KEY` (chave privada, texto ou base64) ou `BANK_SFTP_STN_PASSWORD` · **`BANK_SFTP_STN_HOSTKEY=SHA256:…`** (impressão digital do servidor, dada pelo banco; **obrigatória**: sem ela, ou se não corresponder, a app não liga) · `BANK_SFTP_STN_INBOX=/extratos` · `BANK_SFTP_STN_OUTBOX=/pagamentos` |
+| **📁 Pasta** | O mesmo, com uma pasta local ou partilhada. | `BANK_DIR_STN=/caminho` (subpastas `extratos` e `pagamentos`) |
+| **🏦 Open Banking** | Lê os movimentos da conta através de um agregador (TrueLayer, Tink, GoCardless…) ou da API do banco. | `OB_EUR_URL` (GET que devolve `{ "transactions": [{ "id", "booking_date", "amount", "currency", "description" }] }`) e `OB_EUR_TOKEN`; ou `OB_EUR_PROVIDER=sandbox` para o simulador (o admin cria movimentos de teste) |
+| **✉️ Alertas por e-mail** | Muitos bancos enviam um e-mail por cada entrada. Um serviço de e-mail (Mailgun, SendGrid, Postmark…) reencaminha-o para o endereço mostrado no ecrã Ligações. | `BANK_EMAIL_TOKEN` (segredo do endereço, gerado pelo Render) · `BANK_EMAIL_SENDERS=@bistp.st` (só estes remetentes) · `BANK_EMAIL_CURRENCY=STN` · `BANK_EMAIL_AUTO=true` para confirmar sozinho |
+
+Troque `STN`/`EUR` pela moeda da conta (uma ligação por moeda). A verificação corre de `BANK_SYNC_MINUTES` em `BANK_SYNC_MINUTES` minutos (por omissão, 60), ou no botão **Verificar agora**.
+
+**Segurança dos alertas por e-mail:** um e-mail pode ser falsificado. Por omissão, a app **só sugere** a confirmação ao admin. Com `BANK_EMAIL_AUTO=true`, só confirma sozinha se a **assinatura DKIM do domínio do banco for válida**, e mesmo assim só quando a referência e o valor correspondem exatamente a um carregamento pendente.
+
+**Open Banking:** cada agregador tem a sua API. A app lê um formato normalizado simples; depois de escolher o agregador, basta um pequeno adaptador (ou um serviço intermédio) que devolva esse formato.
+
 ## Carregar com cartão (Stripe)
 
 Os clientes carregam a carteira com **Visa, Mastercard, Apple Pay ou Google Pay** através da **Stripe Checkout**:
@@ -165,7 +182,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 43 testes automáticos (SQLite)
+npm test                            # 46 testes automáticos (SQLite; +1 com servidor SFTP: TEST_SFTP_URL)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
@@ -243,7 +260,8 @@ src/payouts.js     parceiros de pagamento (manual, simulador, API)
 src/features/      sms, push, kyc (identidade), aml (alertas + CSV), passkeys (Face ID),
                    scheduled (envios mensais), bills (recargas/contas), agents (mapa + comissões),
                    ussd, receipts (comprovativos), cards (carregar com cartão, Stripe),
-                   statements (importar extratos e pagar em lote: CSV, MT940, CAMT.053, SEPA)
+                   statements (importar extratos e pagar em lote: CSV, MT940, CAMT.053, SEPA),
+                   banksync (ligações automáticas: SFTP, pasta, Open Banking, alertas por e-mail)
 public/i18n.js     traduções (PT, ES, EN, FR)
 public/            app PWA (instalável no telemóvel)
 tests/             testes automáticos

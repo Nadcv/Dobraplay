@@ -39,6 +39,16 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
   app.use((req, res, next) => (req.path === '/api/me/kyc' || req.path === '/api/admin/statements' ? bigJson : smallJson)(req, res, next));
   // Os gateways USSD enviam formulários (application/x-www-form-urlencoded).
   app.use('/api/ussd', express.urlencoded({ extended: false, limit: '5kb' }));
+  // Alertas de movimento por e-mail: os serviços de e-mail enviam JSON, formulário ou multipart.
+  app.use('/api/webhooks/bank-email', express.urlencoded({ extended: false, limit: '300kb' }), (req, res, next) => {
+    if (!/multipart\/form-data/i.test(req.get('content-type') || '')) return next();
+    const fields = {};
+    const bb = require('busboy')({ headers: req.headers, limits: { fieldSize: 300_000, files: 0, fields: 50 } });
+    bb.on('field', (name, val) => { fields[name] = val; });
+    bb.on('close', () => { req.body = fields; next(); });
+    bb.on('error', next);
+    req.pipe(bb);
+  });
 
   app.use((req, res, next) => {
     res.set({
@@ -285,6 +295,9 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
     } catch (e) { next(e); }
   });
 
+  // O serviço de e-mail reencaminha os alertas do banco para aqui (o token secreto faz parte do endereço).
+  api.post('/webhooks/bank-email/:token', rateLimit({ windowMs: 60000, max: 120, key: (r) => r.ip }), wrap((req) => service.handleBankEmail(req.params.token, body(req))));
+
   // ----- Agente -----
   api.get('/agent/quote', auth, lookupLimit, wrap((req) => service.quoteCashIn(req.user, { to: String(req.query.to || ''), amount: amount(req.query.amount) })));
   api.post('/agent/cash-in', auth, moneyLimit, wrap((req) => {
@@ -365,6 +378,13 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
   api.post('/admin/payout-batches/:id/paid', auth, wrap((req) => service.markBatchPaid(req.user, req.params.id,
     { bankReference: body(req).bank_reference, pin: body(req).pin }, req.ip)));
   api.post('/admin/payout-batches/:id/cancel', auth, wrap((req) => service.cancelBatch(req.user, req.params.id, { pin: body(req).pin }, req.ip)));
+  // Ligações automáticas aos bancos (SFTP, Open Banking, alertas por e-mail).
+  api.get('/admin/bank-sync', auth, wrap((req) => service.bankSyncStatus(req.user)));
+  api.post('/admin/bank-sync/run', auth, rateLimit({ windowMs: 60000, max: 10 }), wrap((req) => service.runBankSyncAdmin(req.user, { only: body(req).only }, req.ip)));
+  api.post('/admin/bank-sync/email/:id/confirm', auth, wrap((req) => service.confirmEmailAlert(req.user, req.params.id, { pin: body(req).pin }, req.ip)));
+  api.post('/admin/bank-sync/email/:id/dismiss', auth, wrap((req) => service.dismissEmailAlert(req.user, req.params.id)));
+  api.post('/admin/bank-sync/sandbox', auth, wrap((req) => service.addSandboxTransaction(req.user,
+    { currency: body(req).currency, amount: amount(body(req).amount), description: body(req).description, pin: body(req).pin }, req.ip)));
   // Simulador USSD (para mostrar o menu a parceiros sem operadora).
   api.post('/admin/ussd/simulate', auth, wrap(async (req) => {
     if (req.user.role !== 'admin') throw new ApiError(403, 'forbidden', 'Sem permissão para esta operação.');
