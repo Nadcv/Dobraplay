@@ -86,6 +86,7 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
     currencies: Object.fromEntries(Object.entries(C.CURRENCIES).map(([k, c]) => [k, { name: c.name, symbol: c.symbol }])),
     fx_spread: C.FX_SPREAD,
     fees: { domestic: 'grátis', international: '1% (mín. 0,50 €, máx. 20 €)', cash_out: '1% (mín. 0,20 €, máx. 8 €)' },
+    card_topup: service.cardTopupConfig(),
   }));
   // Para o alojamento saber se a app está viva (e a base de dados responde).
   api.get('/health', wrap(async () => { await service.listRates(); return { ok: true }; }));
@@ -210,6 +211,15 @@ function createApp(service, { webhookSecret = process.env.PAYOUT_WEBHOOK_SECRET,
     return service.handlePayoutEvent(String(req.params.provider), body(req));
   }));
 
+
+  // ----- Carregar com cartão (Stripe) -----
+  api.get('/quote/card-topup', auth, wrap((req) => service.quoteCardTopup(req.user, { amount: amount(req.query.amount), currency: req.query.currency || 'EUR' })));
+  api.post('/card-topups', auth, moneyLimit, wrap((req) => service.createCardTopup(req.user,
+    { amount: amount(body(req).amount), currency: body(req).currency || 'EUR' }, origin(req), req.ip)));
+  api.get('/card-topups/:id', auth, wrap((req) => service.getCardTopup(req.user, req.params.id)));
+  // A Stripe confirma os pagamentos aqui (assinado com STRIPE_WEBHOOK_SECRET).
+  api.post('/webhooks/stripe', rateLimit({ windowMs: 60000, max: 300, key: (r) => r.ip }), wrap((req) =>
+    service.handleStripeWebhook(req.rawBody ? req.rawBody.toString('utf8') : '', req.get('stripe-signature'))));
 
   // ----- Notificações -----
   api.get('/push/key', wrap(() => service.pushPublicKey()));

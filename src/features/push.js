@@ -72,6 +72,7 @@ module.exports = function push(kit) {
       merchant: ['🛒 Pagamento recebido', `${amount} de ${who}`],
       cash_in: ['⬇ Depósito na carteira', `${amount} depositados`],
       bank_in: ['🏦 Transferência recebida', `${amount} entraram na sua carteira`],
+      card_in: ['💳 Carregamento com cartão', `${amount} entraram na sua carteira`],
       refund: ['↩ Devolução', `${amount} voltaram à sua carteira${t.note ? ' · ' + t.note : ''}`],
       commission: ['💰 Comissão', `Recebeu ${amount} de comissão`],
       issue: ['🏦 Float recebido', `${amount} de float na carteira de agente`],

@@ -10,6 +10,7 @@ const RULES = {
   structuring: 'Envios repetidos perto do limite (possível fracionamento)',
   new_account: 'Conta nova a enviar valores altos',
   fan_in: 'Muitas pessoas diferentes a enviar para a mesma conta',
+  card_dispute: 'Contestação de pagamento com cartão (chargeback)',
 };
 
 module.exports = function aml(kit) {

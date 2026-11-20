@@ -68,6 +68,23 @@ Se um envio **com câmbio** ultrapassar o limite, a app avisa o cliente **antes*
 
 Como cobrir a falta sem pausar envios: agentes que compram float (trazem dinheiro para o banco local), uma reserva inicial da empresa, ou uma linha de crédito do banco parceiro. **Nunca** com o dinheiro de outros clientes.
 
+## Carregar com cartão (Stripe)
+
+Os clientes carregam a carteira com **Visa, Mastercard, Apple Pay ou Google Pay** através da **Stripe Checkout**:
+1. Em **Carregar → Com cartão**, o cliente escolhe o valor (em euros) e vê a taxa (1,5% + 0,25 €, ajustável em `src/config.js → FEES.cardIn`).
+2. É levado à **página segura da Stripe**. A DobraPay **nunca vê nem guarda o número do cartão**.
+3. A Stripe confirma por **webhook assinado**, e o saldo entra na carteira **uma única vez**, mesmo que a Stripe repita a notificação. Se o webhook atrasar, a app confirma diretamente com a Stripe quando o cliente volta.
+4. Se o titular contestar o pagamento (*chargeback*), abre-se um **alerta** no ecrã Alertas.
+
+**Como ativar (modo de teste, grátis):**
+1. Crie conta em https://stripe.com (fica em modo de teste até ativar a conta).
+2. Em **Developers → API keys**, copie a **Secret key** (`sk_test_…`).
+3. Em **Developers → Webhooks → Add endpoint**, use `https://SEU-ENDEREÇO/api/webhooks/stripe` com os eventos `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired` e `charge.dispute.created`. Copie o **Signing secret** (`whsec_…`).
+4. No Render, em **Environment**, preencha `STRIPE_SECRET_KEY` e `STRIPE_WEBHOOK_SECRET`. A opção "Com cartão" aparece sozinha.
+5. Para testar, use o cartão `4242 4242 4242 4242`, com qualquer data futura e qualquer código.
+
+Para receber dinheiro real (`sk_live_…`), a Stripe pede uma **empresa registada** num país suportado (ex.: Portugal) e a verificação da conta.
+
 ## Segurança e conformidade
 
 - **Verificação do número por SMS**: criar conta e recuperar o PIN ("Esqueci o PIN") exigem um código de 6 dígitos enviado por SMS (válido 10 min, 5 tentativas, no máximo 5 SMS por hora por número). Recuperar o PIN termina as sessões noutros telemóveis. Sem fornecedor de SMS configurado, a app funciona em **modo de teste**: o código aparece no ecrã, com esse aviso.
@@ -128,7 +145,7 @@ git clone https://github.com/Nadcv/Dobraplay.git && cd Dobraplay
 npm install
 ADMIN_PHONE=9900000 npm start      # a conta com este número fica administradora
 # abrir http://localhost:3000
-npm test                            # 37 testes automáticos (SQLite)
+npm test                            # 39 testes automáticos (SQLite)
 TEST_DATABASE_URL=postgres://... npm test   # os mesmos testes em PostgreSQL (APAGA essa base!)
 ```
 
@@ -141,6 +158,7 @@ Para experimentar: crie a conta admin (🇸🇹 9900000), uma conta de agente em
 | `DB_FILE` | Sem `DATABASE_URL`, usa este ficheiro SQLite (por omissão `data/dobrapay.db`), só para o computador |
 | `ADMIN_PHONE` | Número da conta administradora |
 | `APP_NAME` | Nome da marca (por omissão DobraPay) |
+| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | Carregar com cartão (Stripe). Sem isto, a opção não aparece |
 | `SMS_HTTP_URL` / `SMS_HTTP_TOKEN` | Fornecedor de SMS (`POST { to, message }`). Sem isto, os códigos aparecem no ecrã (modo de teste) |
 | `OTP_REQUIRED` | `false` desliga o código por SMS no registo (não recomendado) |
 | `USSD_SECRET` | Chave que o gateway USSD da operadora envia (`?key=` ou cabeçalho `X-USSD-Key`) |
@@ -204,7 +222,7 @@ src/app.js         API HTTP + segurança (rate limit, cabeçalhos, webhooks assi
 src/payouts.js     parceiros de pagamento (manual, simulador, API)
 src/features/      sms, push, kyc (identidade), aml (alertas + CSV), passkeys (Face ID),
                    scheduled (envios mensais), bills (recargas/contas), agents (mapa + comissões),
-                   ussd, receipts (comprovativos)
+                   ussd, receipts (comprovativos), cards (carregar com cartão, Stripe)
 public/i18n.js     traduções (PT, ES, EN, FR)
 public/            app PWA (instalável no telemóvel)
 tests/             testes automáticos

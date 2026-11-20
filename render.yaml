@@ -30,3 +30,8 @@ services:
       # Chave para o gateway USSD da operadora (gerada pelo Render).
       - key: USSD_SECRET
         generateValue: true
+      # Carregar com cartão (Stripe): chave secreta (sk_test_… / sk_live_…) e segredo do webhook (whsec_…).
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false

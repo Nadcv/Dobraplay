@@ -1345,7 +1345,7 @@ function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsS
     newSessionFor: async (u) => ({ token: await newSession(u.id), user: await publicUser(u) }),
   };
   const extra = {};
-  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts']) {
+  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts', 'cards']) {
     Object.assign(extra, require('./features/' + name)(kit));
   }
 

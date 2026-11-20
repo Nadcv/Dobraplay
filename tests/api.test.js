@@ -14,6 +14,9 @@ const USSD_KEY = 'ussd-de-teste';
 // Parceiro de pagamentos falso (para testar o modo 'http'): regista as ordens recebidas.
 const partner = { orders: [], fail: false, server: null, url: '' };
 const WEBHOOK_SECRET = 'segredo-de-teste';
+// Stripe falsa: guarda as sessões de pagamento criadas e responde às consultas.
+const stripeMock = { sessions: {}, requests: [], server: null, url: '' };
+const STRIPE_WHSEC = 'whsec_teste';
 
 // Por omissão os testes usam SQLite em memória. Com TEST_DATABASE_URL correm
 // contra PostgreSQL (a base de dados é APAGADA: use uma base só de testes).
@@ -39,9 +42,27 @@ test.before(async () => {
   }).listen(0);
   await new Promise((r) => partner.server.once('listening', r));
   partner.url = `http://127.0.0.1:${partner.server.address().port}/payouts`;
+  stripeMock.server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (req.method === 'POST' && req.url === '/v1/checkout/sessions') {
+        const id = 'cs_test_' + (Object.keys(stripeMock.sessions).length + 1);
+        stripeMock.requests.push({ body: new URLSearchParams(raw), auth: req.headers.authorization, idem: req.headers['idempotency-key'] });
+        stripeMock.sessions[id] = { id, url: `https://checkout.stripe.com/c/pay/${id}`, payment_status: 'unpaid', status: 'open', payment_intent: null };
+        return res.end(JSON.stringify(stripeMock.sessions[id]));
+      }
+      const m = /^\/v1\/checkout\/sessions\/(.+)$/.exec(req.url);
+      if (req.method === 'GET' && m && stripeMock.sessions[m[1]]) return res.end(JSON.stringify(stripeMock.sessions[m[1]]));
+      res.writeHead(404); res.end('{"error":{"message":"não existe"}}');
+    });
+  }).listen(0);
+  await new Promise((r) => stripeMock.server.once('listening', r));
+  stripeMock.url = `http://127.0.0.1:${stripeMock.server.address().port}`;
   db = await openDb(PG_URL ? { url: PG_URL } : { file: ':memory:' });
   service = createService(db, {
-    adminPhone: ADMIN, sandboxDelayMs: 100, env: { PAYOUT_HTTP_URL: partner.url, PAYOUT_HTTP_TOKEN: 'token-parceiro' },
+    adminPhone: ADMIN, sandboxDelayMs: 100, env: { PAYOUT_HTTP_URL: partner.url, PAYOUT_HTTP_TOKEN: 'token-parceiro', STRIPE_SECRET_KEY: 'sk_test_123', STRIPE_WEBHOOK_SECRET: STRIPE_WHSEC, STRIPE_API_BASE: stripeMock.url },
     pushSender: async (sub, payload, userId) => {
       if (sub.endpoint.includes('expirado')) throw Object.assign(new Error('gone'), { statusCode: 410 });
       pushes.push({ userId, endpoint: sub.endpoint, ...JSON.parse(payload) });
@@ -51,7 +72,7 @@ test.before(async () => {
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}/api`;
 });
-test.after(async () => { server.close(); partner.server.close(); await db.close(); });
+test.after(async () => { server.close(); partner.server.close(); stripeMock.server.close(); await db.close(); });
 
 async function call(method, path, body, token) {
   const res = await fetch(base + path, {
@@ -820,6 +841,71 @@ test('relatórios: exportação CSV dos movimentos só para o admin', async () =
   assert.ok(csv.split('\r\n').length > 20);
   assert.match(csv, /;commission;/);
   assert.equal((await fetch(base + '/admin/export.csv', { headers: { authorization: 'Bearer ' + ana.token } })).status, 403);
+});
+
+// ---------------- Carregar com cartão (Stripe) ----------------
+test('cartão: pagamento na página da Stripe, confirmado por webhook assinado, credita uma única vez', async () => {
+  const cfg = (await call('GET', '/config')).body.card_topup;
+  assert.deepEqual([cfg.enabled, cfg.test_mode], [true, true]);
+  const q = (await call('GET', '/quote/card-topup?amount=50', null, maria.token)).body;
+  assert.deepEqual([q.amount, q.fee, q.total], [5_000, 100, 5_100]); // 1,5% + 0,25 € = 1,00 €
+  assert.equal((await call('GET', '/quote/card-topup?amount=2', null, maria.token)).body.error, 'bad_amount');
+  const c = await call('POST', '/card-topups', { amount: '50' }, maria.token);
+  assert.equal(c.status, 200, JSON.stringify(c.body));
+  assert.match(c.body.url, /^https:\/\/checkout\.stripe\.com\//);
+  assert.equal(c.body.status, 'pending');
+  const sent = stripeMock.requests.at(-1);
+  assert.equal(sent.auth, 'Bearer sk_test_123');
+  assert.equal(sent.idem, c.body.id);
+  assert.equal(sent.body.get('line_items[0][price_data][unit_amount]'), '5100');
+  assert.equal(sent.body.get('line_items[0][price_data][currency]'), 'eur');
+  assert.equal(sent.body.get('client_reference_id'), c.body.id);
+  assert.match(sent.body.get('success_url'), new RegExp(`\\?cartao=ok&id=${c.body.id}$`));
+
+  const sessionId = Object.keys(stripeMock.sessions).at(-1);
+  const event = { id: 'evt_1', type: 'checkout.session.completed',
+    data: { object: { id: sessionId, client_reference_id: c.body.id, payment_status: 'paid', payment_intent: 'pi_test_1', metadata: { topup_id: c.body.id } } } };
+  const hook = async (payload, { secret = STRIPE_WHSEC, t = Math.floor(Date.now() / 1000), header } = {}) => {
+    const raw = JSON.stringify(payload);
+    const sig = header ?? `t=${t},v1=${require('crypto').createHmac('sha256', secret).update(`${t}.${raw}`).digest('hex')}`;
+    const res = await fetch(base + '/webhooks/stripe', { method: 'POST', headers: { 'content-type': 'application/json', 'stripe-signature': sig }, body: raw });
+    return { status: res.status, body: await res.json() };
+  };
+  assert.equal((await hook(event, { header: '' })).status, 400);                         // sem assinatura
+  assert.equal((await hook(event, { secret: 'whsec_falso' })).status, 400);              // assinatura falsa
+  assert.equal((await hook(event, { t: Math.floor(Date.now() / 1000) - 3600 })).status, 400); // repetição antiga
+  const before = await bal(maria.token, 'EUR');
+  pushes.length = 0;
+  await call('POST', '/push/subscribe', { endpoint: 'https://push.exemplo/maria', keys: { p256dh: 'p', auth: 'a' } }, maria.token);
+  assert.equal((await hook(event)).status, 200);
+  assert.equal(await bal(maria.token, 'EUR'), before + 5_000);
+  assert.equal((await hook(event)).status, 200);                                          // a Stripe repete: não credita outra vez
+  assert.equal(await bal(maria.token, 'EUR'), before + 5_000);
+  assert.equal((await call('GET', `/card-topups/${c.body.id}`, null, maria.token)).body.status, 'completed');
+  assert.equal((await call('GET', `/card-topups/${c.body.id}`, null, ana.token)).status, 404);
+  const hist = (await call('GET', '/transactions', null, maria.token)).body;
+  assert.equal(hist[0].type, 'card_in');
+  await sleep(50);
+  assert.ok(pushes.some((p) => p.userId === maria.user.id && /cartão/.test(p.title)));
+
+  // Contestação do cartão (chargeback) → alerta para o admin.
+  await hook({ id: 'evt_2', type: 'charge.dispute.created', data: { object: { payment_intent: 'pi_test_1', amount: 5100, reason: 'fraudulent' } } });
+  const alerts = (await call('GET', '/admin/alerts', null, admin.token)).body;
+  assert.ok(alerts.some((a) => a.rule === 'card_dispute' && /fraudulent/.test(a.detail)));
+});
+
+test('cartão: se o webhook atrasar, a app confirma ao voltar da página de pagamento; expirados não creditam', async () => {
+  const c = (await call('POST', '/card-topups', { amount: '20' }, maria.token)).body;
+  const sessionId = Object.keys(stripeMock.sessions).at(-1);
+  assert.equal((await call('GET', `/card-topups/${c.id}`, null, maria.token)).body.status, 'pending'); // ainda não pagou
+  Object.assign(stripeMock.sessions[sessionId], { payment_status: 'paid', payment_intent: 'pi_test_2' });
+  const before = await bal(maria.token, 'EUR');
+  assert.equal((await call('GET', `/card-topups/${c.id}`, null, maria.token)).body.status, 'completed');
+  assert.equal(await bal(maria.token, 'EUR'), before + 2_000);
+  const e = (await call('POST', '/card-topups', { amount: '10' }, maria.token)).body;
+  stripeMock.sessions[Object.keys(stripeMock.sessions).at(-1)].status = 'expired';
+  assert.equal((await call('GET', `/card-topups/${e.id}`, null, maria.token)).body.status, 'expired');
+  assert.equal(await bal(maria.token, 'EUR'), before + 2_000);
 });
 
 test('livro-razão: em cada moeda a soma de todos os saldos é zero', async () => {

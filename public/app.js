@@ -286,7 +286,8 @@ async function showHome() {
   const link = JSON.parse(sessionStorage.getItem('dp_link') || 'null');
   if (link && state.me) {
     sessionStorage.removeItem('dp_link');
-    if (link.pagar) openSheet('pay', { code: link.pagar });
+    if (link.cartao) waitCardTopup(link.id, link.cartao);
+    else if (link.pagar) openSheet('pay', { code: link.pagar });
     else if (link.enviar) openSheet('send', { to: link.enviar, amount: link.valor ? link.valor.replace('.', ',') : '' });
   }
 }
@@ -329,8 +330,8 @@ $('#balance').addEventListener('click', () => {
 });
 
 const TX_LABEL = { p2p: 'Transferência', request: 'Pedido pago', cash_in: 'Depósito', cash_out: 'Levantamento', issue: 'Float emitido', exchange: 'Câmbio',
-  bank_in: 'Carregamento por banco', bill: 'Recarga / conta', commission: 'Comissão', bank_out: 'Para conta bancária', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
-const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄', bank_in: '🏦', bank_out: '🏦', bill: '💡', commission: '💰', merchant: '🛒', refund: '↩', settlement: '🏦' };
+  bank_in: 'Carregamento por banco', card_in: 'Carregamento com cartão', bill: 'Recarga / conta', commission: 'Comissão', bank_out: 'Para conta bancária', merchant: 'Pagamento em loja', refund: 'Devolução', settlement: 'Acerto entre bancos' };
+const TX_ICON = { p2p: '↗', request: '✋', cash_in: '⬇', cash_out: '💵', issue: '🏦', exchange: '⇄', bank_in: '🏦', card_in: '💳', bank_out: '🏦', bill: '💡', commission: '💰', merchant: '🛒', refund: '↩', settlement: '🏦' };
 
 function renderHistory(txs) {
   const ul = $('#history');
@@ -346,7 +347,7 @@ function renderHistory(txs) {
       title = toPerson ? toPerson[1] : `${flagOf(t.to.country)} ${t.to.name}`;
       amt = esc(`-${money(t.amount + t.fee, t.currency)}`);
     } else {
-      title = t.type === 'bank_in' ? 'Transferência bancária' : `${flagOf(t.from.country)} ${t.from.name}`;
+      title = t.type === 'bank_in' ? 'Transferência bancária' : t.type === 'card_in' ? window.t('Cartão') : `${flagOf(t.from.country)} ${t.from.name}`;
       amt = esc(`+${money(t.to_amount, t.to_currency)}`);
     }
     const conv = t.currency !== t.to_currency && t.direction !== 'self'
@@ -354,7 +355,7 @@ function renderHistory(txs) {
     return `<li data-tx="${esc(t.id)}" style="cursor:pointer">
       <span class="tx-ico">${TX_ICON[t.type] || '•'}</span>
       <span class="tx-main"><strong>${esc(title)}</strong>
-        <small>${esc(TX_LABEL[t.type])} · ${esc(when(t.created_at))}${esc(conv)}${t.note ? ' · ' + esc(t.note) : ''}</small></span>
+        <small>${esc(TX_LABEL[t.type])} · ${esc(when(t.created_at))}${esc(conv)}${t.note && t.note !== TX_LABEL[t.type] ? ' · ' + esc(t.note) : ''}</small></span>
       <span class="tx-amt ${cls}" style="text-align:right">${amt}</span>
     </li>`;
   }).join('');
@@ -590,7 +591,8 @@ const SHEETS = {
   // ---------- Carregar / Levantar: escolher como ----------
   topup: () => ({
     title: 'Carregar a carteira',
-    html: `<button type="button" class="choice" data-go="bankin"><span>🏦</span><div><strong>Por transferência bancária</strong><small>Do seu banco para a conta da DobraPay (ex.: MB Way/homebanking em Portugal, BISTP em São Tomé).</small></div></button>
+    html: `${CFG.card_topup && CFG.card_topup.enabled ? `<button type="button" class="choice" data-go="cardTopup"><span>💳</span><div><strong>${t('Com cartão')}</strong><small>${t('Visa, Mastercard, Apple Pay ou Google Pay. O saldo entra na hora.')}</small></div></button>` : ''}
+      <button type="button" class="choice" data-go="bankin"><span>🏦</span><div><strong>Por transferência bancária</strong><small>Do seu banco para a conta da DobraPay (ex.: MB Way/homebanking em Portugal, BISTP em São Tomé).</small></div></button>
       <button type="button" class="choice" data-go="agentsNear"><span>📍</span><div><strong>${t('Agentes perto de mim')}</strong><small>${t('Onde depositar ou levantar dinheiro')}</small></div></button>
       <button type="button" class="choice" data-go="agentInfo"><span>🧑🏾‍💼</span><div><strong>Em dinheiro, num agente</strong><small>Entregue o dinheiro a um agente DobraPay e ele carrega a sua carteira na hora.</small></div></button>`,
   }),
@@ -727,6 +729,26 @@ const SHEETS = {
       refresh();
       openSheet('bankRequest', r.request);
       toast(`Enviado para ${f.get('holder')}. Avisamos quando o banco confirmar.`);
+    },
+  }),
+
+
+  // ---------- Carregar com cartão (Stripe) ----------
+  cardTopup: () => ({
+    title: t('Carregar com cartão'),
+    html: `<form>${CFG.card_topup.test_mode ? `<p class="who">🧪 ${t('Modo de teste: use o cartão 4242 4242 4242 4242, qualquer data futura e qualquer código.')}</p>` : ''}
+      ${amountField(t('Valor a carregar (EUR)'))}${quoteBox}
+      <p class="hint">${t('Vai para a página segura da Stripe para pagar. A DobraPay nunca vê o número do seu cartão.')}</p>
+      <button class="btn primary">💳 ${t('Pagar com cartão')}</button></form>`,
+    quote: async (f) => {
+      const q = await api('GET', '/quote/card-topup?' + qs({ amount: f.get('amount') }));
+      return { ...q, currency: 'EUR', to_currency: 'EUR', to_amount: q.amount, rate: 1 };
+    },
+    quoteOpts: { payLabel: 'Carrega', getLabel: 'Entra na carteira' },
+    submit: async (f) => {
+      const r = await api('POST', '/card-topups', { amount: f.get('amount') });
+      sessionStorage.setItem('dp_card', r.id);
+      location.href = r.url; // página segura da Stripe
     },
   }),
 
@@ -1387,6 +1409,7 @@ function parseLink(raw) {
     const url = new URL(raw.replace(/^dobrapay:pay\?to=/, 'https://x/?enviar=').replace(/&amount=/, '&valor='));
     const p = url.searchParams;
     if (p.get('pagar')) return { pagar: p.get('pagar') };
+    if (p.get('cartao')) return { cartao: p.get('cartao'), id: p.get('id') };
     if (p.get('enviar')) return { enviar: p.get('enviar'), valor: p.get('valor') };
   } catch { /* não é um endereço */ }
   return null;
@@ -1434,6 +1457,23 @@ $('#sheet').addEventListener('click', (e) => { if (e.target.id === 'sheet') clos
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
 document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.open)));
 
+
+
+// Ao voltar da página da Stripe: espera pela confirmação do pagamento.
+async function waitCardTopup(id, result) {
+  if (!id) return;
+  if (result !== 'ok') { toast(t('Pagamento cancelado. Nada foi cobrado.')); return; }
+  toast(t('A confirmar o pagamento…'));
+  for (let i = 0; i < 15; i++) {
+    try {
+      const r = await api('GET', `/card-topups/${encodeURIComponent(id)}`);
+      if (r.status === 'completed') { toast(t('Carregados {v} na sua carteira ✓', { v: money(r.amount, r.currency) })); refresh(); return; }
+      if (r.status !== 'pending') { toast(t('O pagamento não foi concluído.'), true); return; }
+    } catch (err) { toast(errText(err), true); return; }
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  toast(t('O pagamento ainda está a ser confirmado. O saldo aparece assim que a Stripe confirmar.'));
+}
 
 // ---------------- Comprovativo (imagem desenhada no telemóvel) ----------------
 function drawReceipt(tx) {
@@ -1533,7 +1573,7 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catc
   if (link) {
     sessionStorage.setItem('dp_link', JSON.stringify(link));
     history.replaceState(null, '', location.pathname); // limpa o endereço
-    if (!state.token) toast(link.pagar ? 'Entre na sua conta para pagar.' : 'Entre na sua conta para enviar.');
+    if (!state.token && !link.cartao) toast(link.pagar ? 'Entre na sua conta para pagar.' : 'Entre na sua conta para enviar.');
   }
   if (state.token) showHome(); else $('#auth').hidden = false;
 })();

@@ -46,7 +46,8 @@ module.exports = {
     exchange: () => 0,                                                          // trocar entre as próprias carteiras: só a margem de câmbio
     bankIn: () => 0,                                                            // carregar por transferência bancária: grátis
     bankOut: (eur) => Math.min(Math.max(Math.round(eur * 0.01), 50), 5 * EUR),  // levantar para o banco: 1% (mín. 0,50 €, máx. 5 €)
-    merchant: () => 0,                                                          // pagar numa loja: grátis para o cliente (só a margem se houver câmbio)
+    merchant: () => 0,
+    cardIn: (eur) => Math.round(eur * 0.015) + 25,                              // carregar com cartão: 1,5% + 0,25 € (cobre a taxa da Stripe)                                                          // pagar numa loja: grátis para o cliente (só a margem se houver câmbio)
   },
 
   MIN_AMOUNT: 1, // 1 cêntimo (valida-se também pelo mínimo em euros abaixo)

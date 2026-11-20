@@ -69,7 +69,7 @@ const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS transactions (
     id               TEXT PRIMARY KEY,
-    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission')),
+    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission','card_in')),
     from_account     INTEGER NOT NULL REFERENCES accounts(id),
     to_account       INTEGER NOT NULL REFERENCES accounts(id),
     amount           INTEGER NOT NULL CHECK (amount > 0),     -- na moeda de origem
@@ -360,6 +360,23 @@ const SCHEMA = `
     updated_at  INTEGER NOT NULL
   );
 
+  -- Carregamentos com cartão (Stripe Checkout). A DobraPay nunca vê o cartão:
+  -- o cliente paga na página da Stripe e a Stripe confirma por webhook.
+  CREATE TABLE IF NOT EXISTS card_topups (
+    id              TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    amount          INTEGER NOT NULL CHECK (amount > 0),   -- o que entra na carteira
+    fee             INTEGER NOT NULL DEFAULT 0,            -- taxa do cartão (paga pelo cliente)
+    currency        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','failed','expired')),
+    session_id      TEXT,                                  -- Stripe Checkout Session
+    payment_intent  TEXT,
+    tx_id           TEXT REFERENCES transactions(id),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS card_topups_session ON card_topups(session_id);
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY,
     user_id  INTEGER,
@@ -514,7 +531,7 @@ const MIGRATIONS = {
     postgres: `
       ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
       ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
-        CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission'));
+        CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission','card_in'));
     `,
     sqlite: null,
   },
