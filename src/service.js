@@ -6,6 +6,8 @@
 const crypto = require('crypto');
 const C = require('./config');
 const { isUniqueViolation } = require('./db');
+const { createPayoutProviders } = require('./payouts');
+const { createSmsSender } = require('./features/sms');
 const {
   ApiError, normalizePhone, countryOfPhone, isCurrency, hashPin, verifyPin, isValidPin, sha256, cleanText, formatAmount,
   normalizeIban, formatIban, randomCode,
@@ -21,8 +23,25 @@ const fmt = formatAmount;
 let seqCounter = 0;
 const nextSeq = () => now() * 1000 + (seqCounter++ % 1000);
 
-function createService(db, { adminPhone } = {}) {
+function createService(db, { adminPhone, sandboxDelayMs, env = process.env, smsSender, pushSender, requireOtp } = {}) {
   const adminPhoneNorm = adminPhone ? normalizePhone(adminPhone) : null;
+  const sms = smsSender || createSmsSender(env);
+  // Verificação por SMS obrigatória no registo (desliga-se com OTP_REQUIRED=false).
+  const otpRequired = requireOtp ?? env.OTP_REQUIRED !== 'false';
+
+  // Acontecimentos que as funcionalidades extra podem ouvir (ex.: notificações).
+  const events = new (require('events'))();
+  events.on('error', (err) => console.error('Erro num acontecimento:', err.message));
+
+  // Ações que correm DEPOIS de uma operação de dinheiro ficar gravada
+  // (notificações, alertas antifraude…). Nunca atrasam nem anulam a operação.
+  const afterCommitHooks = [];
+  const afterCommit = (txId) => {
+    if (!txId) return;
+    for (const h of afterCommitHooks) Promise.resolve().then(() => h(txId)).catch((err) => console.error('Erro depois da operação:', err.message));
+  };
+  // Parceiros de pagamento; as confirmações chegam a handlePayoutEvent.
+  const providers = createPayoutProviders({ onEvent: (...a) => handlePayoutEvent(...a), sandboxDelayMs, env });
   const like = db.dialect === 'postgres' ? 'ILIKE' : 'LIKE';
 
   const userById = (id) => db.get('SELECT * FROM users WHERE id = ?', id);
@@ -108,8 +127,59 @@ function createService(db, { adminPhone } = {}) {
     if (user.failed_pins) await db.run('UPDATE users SET failed_pins = 0 WHERE id = ?', user.id);
   }
 
+  // ---------- Verificação por SMS ----------
+  const otpHash = (phone, purpose, code) => sha256(`${phone}|${purpose}|${code}`);
+
+  // Envia um código de 6 dígitos. Para recuperar o PIN, a resposta é igual
+  // quer o número tenha conta quer não (não revela quem é cliente).
+  async function requestOtp({ phone, country, purpose = 'register' }, ip) {
+    if (!['register', 'reset_pin'].includes(purpose)) throw new ApiError(400, 'bad_purpose', 'Pedido inválido.');
+    const ctry = C.COUNTRIES[country] ? country : 'ST';
+    const p = normalizePhone(phone, ctry);
+    if (!p) throw new ApiError(400, 'bad_phone', `Número inválido para ${C.COUNTRIES[ctry].name}. Exemplo: ${C.COUNTRIES[ctry].example}.`);
+    const exists = await userByPhone(p);
+    if (purpose === 'register' && exists) throw new ApiError(409, 'phone_taken', 'Este número já tem conta. Entre com o seu PIN.');
+    const { n } = await db.get('SELECT COUNT(*) AS n FROM otp_codes WHERE phone = ? AND created_at > ?', p, now() - 3_600_000);
+    if (n >= C.OTP_MAX_PER_HOUR) throw new ApiError(429, 'otp_limit', 'Pediu demasiados códigos. Tente de novo dentro de uma hora.');
+    const out = { phone: p, sent: true, expires_at: now() + C.OTP_MINUTES * 60000 };
+    if (purpose === 'reset_pin' && !exists) return out;
+    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    await db.run('INSERT INTO otp_codes (phone, purpose, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
+      p, purpose, otpHash(p, purpose, code), out.expires_at, now());
+    await sms.send(p, `${C.APP_NAME}: o seu código é ${code}. Válido ${C.OTP_MINUTES} min. Nunca o partilhe.`);
+    await audit(exists ? exists.id : null, 'otp_sent', { purpose, provider: sms.name }, ip);
+    // Em modo de teste (sem fornecedor de SMS) o código é mostrado no ecrã.
+    return sms.sandbox ? { ...out, dev_code: code } : out;
+  }
+
+  async function verifyOtp(phone, purpose, code) {
+    const row = await db.get('SELECT * FROM otp_codes WHERE phone = ? AND purpose = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1', phone, purpose);
+    if (!row || row.expires_at < now()) throw new ApiError(400, 'otp_expired', 'O código expirou ou não existe. Peça um novo código.');
+    if (row.attempts >= C.OTP_MAX_ATTEMPTS) throw new ApiError(423, 'otp_locked', 'Demasiadas tentativas. Peça um novo código.');
+    if (typeof code !== 'string' || row.code_hash !== otpHash(phone, purpose, code.trim())) {
+      await db.run('UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?', row.id);
+      throw new ApiError(401, 'otp_wrong', `Código errado. Restam ${C.OTP_MAX_ATTEMPTS - row.attempts - 1} tentativas.`);
+    }
+    await db.run('UPDATE otp_codes SET used_at = ? WHERE id = ?', now(), row.id);
+  }
+
+  // Esqueci o PIN: código por SMS + PIN novo. Termina as sessões noutros telemóveis.
+  async function resetPin({ phone, country, code, newPin }, ip) {
+    const p = normalizePhone(phone, C.COUNTRIES[country] ? country : 'ST');
+    if (!p) throw new ApiError(400, 'bad_phone', 'Número inválido.');
+    if (!isValidPin(newPin)) throw new ApiError(400, 'bad_pin', 'O novo PIN deve ter 4 a 6 dígitos e não pode ser óbvio.');
+    const user = await userByPhone(p);
+    if (!user) throw new ApiError(400, 'otp_expired', 'O código expirou ou não existe. Peça um novo código.');
+    if (user.status !== 'active') throw new ApiError(403, 'blocked', 'Conta bloqueada. Contacte o apoio ao cliente.');
+    await verifyOtp(p, 'reset_pin', code);
+    await db.run('UPDATE users SET pin_hash = ?, failed_pins = 0, locked_until = 0 WHERE id = ?', hashPin(newPin), user.id);
+    await db.run('DELETE FROM sessions WHERE user_id = ?', user.id);
+    await audit(user.id, 'pin_reset', null, ip);
+    return { token: await newSession(user.id), user: await publicUser(await userById(user.id)) };
+  }
+
   // ---------- Contas e sessões ----------
-  async function register({ phone, name, pin, country }, ip) {
+  async function register({ phone, name, pin, country, code }, ip) {
     const ctry = C.COUNTRIES[country] ? country : null;
     if (!ctry) throw new ApiError(400, 'bad_country', 'Escolha o seu país.');
     const p = normalizePhone(phone, ctry);
@@ -120,6 +190,8 @@ function createService(db, { adminPhone } = {}) {
     if (!isValidPin(pin)) throw new ApiError(400, 'bad_pin', 'O PIN deve ter 4 a 6 dígitos e não pode ser óbvio (ex.: 1111, 1234).');
     const taken = new ApiError(409, 'phone_taken', 'Este número já tem conta. Entre com o seu PIN.');
     if (await userByPhone(p)) throw taken;
+    // O código por SMS prova que a pessoa tem mesmo este número.
+    if (otpRequired) await verifyOtp(p, 'register', code);
     const role = p === adminPhoneNorm ? 'admin' : 'user';
     const cur = C.COUNTRIES[realCountry].currency;
     let user;
@@ -240,20 +312,49 @@ function createService(db, { adminPhone } = {}) {
       mid_rate: from === to ? 1 : Number((r[to] / r[from]).toPrecision(8)),
     };
   }
+  // ---------- Câmbio garantido ----------
+  // Cada cotação mostrada ao cliente fica guardada durante C.QUOTE_SECONDS.
+  // Se ele confirmar a tempo (com o quote_id), paga exatamente o que viu,
+  // mesmo que o câmbio mude entretanto. Cada cotação só pode ser usada uma vez.
+  async function issueQuote(user, kind, key, q) {
+    const id = crypto.randomUUID();
+    const expires = now() + C.QUOTE_SECONDS * 1000;
+    if (Math.random() < 0.02) await db.run('DELETE FROM quotes WHERE expires_at < ?', now() - 86_400_000); // limpeza
+    await db.run('INSERT INTO quotes (id, user_id, kind, qkey, data, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      id, user.id, kind, key, JSON.stringify(q), expires, now());
+    return { ...q, quote_id: id, expires_at: expires, locked_seconds: C.QUOTE_SECONDS };
+  }
+
+  // Tem de ser chamado DENTRO de db.tx().
+  async function takeQuote(user, id, kind, key) {
+    const row = await db.get('SELECT * FROM quotes WHERE id = ? FOR UPDATE', String(id));
+    const invalid = () => new ApiError(409, 'quote_invalid', 'Esta cotação já não corresponde ao pedido. Veja a nova cotação e confirme de novo.');
+    if (!row || row.user_id !== user.id || row.kind !== kind || row.qkey !== key) throw invalid();
+    if (row.used_at) throw new ApiError(409, 'quote_used', 'Esta cotação já foi usada. Veja a nova cotação e confirme de novo.');
+    if (row.expires_at < now()) throw new ApiError(409, 'quote_expired', `O câmbio garantido expirou (${C.QUOTE_SECONDS} s). Veja a nova cotação e confirme de novo.`);
+    await db.run('UPDATE quotes SET used_at = ? WHERE id = ?', now(), row.id);
+    const q = JSON.parse(row.data);
+    delete q.paused; delete q.recipient;
+    return q;
+  }
+  const quoteOr = (user, quoteId, kind, key, compute) => (quoteId ? takeQuote(user, quoteId, kind, key) : compute());
+
   const feeKindBetween = (a, b, fromCur, toCur) => (fromCur !== toCur || a.country !== b.country ? 'international' : 'domestic');
 
   async function quoteTransfer(user, { to, amount, fromCurrency }) {
     const recipient = await findRecipient(user, to);
     const from = needCurrency(fromCurrency || user.receive_currency);
     const toCur = recipient.receive_currency;
-    return {
+    return issueQuote(user, 'transfer', `${recipient.id}|${from}|${toCur}|${amount}`, {
       ...await buildQuote({ amount, from, to: toCur, feeKind: feeKindBetween(user, recipient, from, toCur) }),
       recipient: { name: recipient.name, phone: recipient.phone, country: recipient.country },
-    };
+    });
   }
 
-  const quoteExchange = (user, { amount, fromCurrency, toCurrency }) =>
-    buildQuote({ amount, from: needCurrency(fromCurrency), to: needCurrency(toCurrency), feeKind: 'exchange' });
+  async function quoteExchange(user, { amount, fromCurrency, toCurrency }) {
+    const from = needCurrency(fromCurrency), to = needCurrency(toCurrency);
+    return issueQuote(user, 'exchange', `${from}|${to}|${amount}`, await buildQuote({ amount, from, to, feeKind: 'exchange' }));
+  }
 
   // ---------- Motor de movimentos (dupla entrada por moeda) ----------
   // Tem de ser chamado DENTRO de db.tx(). `quote` vem de buildQuote().
@@ -357,6 +458,7 @@ function createService(db, { adminPhone } = {}) {
     if (before) return before;
     try {
       const id = await db.tx(() => fn(key));
+      afterCommit(id);
       return { transaction: await txView(id, user), replayed: false };
     } catch (err) {
       // Dois pedidos iguais ao mesmo tempo: o segundo devolve o resultado do primeiro.
@@ -386,7 +488,7 @@ function createService(db, { adminPhone } = {}) {
   }
 
   // ---------- Operações do cliente ----------
-  async function transfer(user, { to, amount, fromCurrency, note, pin, idempotencyKey, expectedTo }, ip) {
+  async function transfer(user, { to, amount, fromCurrency, note, pin, idempotencyKey, expectedTo, quoteId }, ip) {
     const recipient = await findRecipient(user, to);
     if (recipient.id === user.id) throw new ApiError(400, 'same_account', 'Para mudar dinheiro entre as suas moedas use "Câmbio".');
     const from = needCurrency(fromCurrency || user.receive_currency);
@@ -395,7 +497,8 @@ function createService(db, { adminPhone } = {}) {
       const src = await walletOf(user.id, from);
       if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${from}.`);
       const toCur = recipient.receive_currency;
-      const quote = await buildQuote({ amount, from, to: toCur, feeKind: feeKindBetween(user, recipient, from, toCur) });
+      const quote = await quoteOr(user, quoteId, 'transfer', `${recipient.id}|${from}|${toCur}|${amount}`,
+        () => buildQuote({ amount, from, to: toCur, feeKind: feeKindBetween(user, recipient, from, toCur) }));
       return move({ type: 'p2p', fromAcc: src, toAcc: await ensureWallet(recipient.id, toCur), quote,
         note: cleanText(note, 140), createdBy: user.id, idemKey: key, expectedTo });
     });
@@ -404,7 +507,7 @@ function createService(db, { adminPhone } = {}) {
   }
 
   // Trocar dinheiro entre as próprias carteiras (ex.: Dobras → Euros).
-  async function exchange(user, { amount, fromCurrency, toCurrency, pin, idempotencyKey, expectedTo }, ip) {
+  async function exchange(user, { amount, fromCurrency, toCurrency, pin, idempotencyKey, expectedTo, quoteId }, ip) {
     const from = needCurrency(fromCurrency), to = needCurrency(toCurrency);
     if (from === to) throw new ApiError(400, 'same_currency', 'Escolha duas moedas diferentes.');
     await checkPin(user, pin, ip);
@@ -412,7 +515,8 @@ function createService(db, { adminPhone } = {}) {
       const src = await walletOf(user.id, from);
       if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${from}.`);
       return move({ type: 'exchange', fromAcc: src, toAcc: await ensureWallet(user.id, to),
-        quote: await buildQuote({ amount, from, to, feeKind: 'exchange' }), note: `Câmbio ${from} → ${to}`,
+        quote: await quoteOr(user, quoteId, 'exchange', `${from}|${to}|${amount}`, () => buildQuote({ amount, from, to, feeKind: 'exchange' })),
+        note: `Câmbio ${from} → ${to}`,
         createdBy: user.id, idemKey: key, expectedTo });
     });
     if (!res.replayed) await audit(user.id, 'exchange', { tx: res.transaction.id, amount, from, to }, ip);
@@ -439,6 +543,7 @@ function createService(db, { adminPhone } = {}) {
     if (n >= 3) throw new ApiError(429, 'too_many_requests', 'Já tem 3 pedidos pendentes para esta pessoa.');
     const { id } = await db.get('INSERT INTO money_requests (requester_id, payer_id, amount, currency, note, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
       user.id, payer.id, amount, cur, cleanText(note, 140), now());
+    events.emit('request_created', { requester: user, payer, amount, currency: cur, note });
     return requestView(await db.get('SELECT * FROM money_requests WHERE id = ?', id));
   }
 
@@ -467,10 +572,11 @@ function createService(db, { adminPhone } = {}) {
 
   async function quoteRequest(user, id, { fromCurrency }) {
     const r = await pendingRequestFor(user, id);
-    return requestQuote(user, r, needCurrency(fromCurrency || user.receive_currency));
+    const from = needCurrency(fromCurrency || user.receive_currency);
+    return issueQuote(user, 'request', `${r.id}|${from}`, await requestQuote(user, r, from));
   }
 
-  async function payRequest(user, id, { pin, fromCurrency, idempotencyKey }, ip) {
+  async function payRequest(user, id, { pin, fromCurrency, idempotencyKey, quoteId }, ip) {
     const r = await pendingRequestFor(user, id);
     const from = needCurrency(fromCurrency || user.receive_currency);
     await checkPin(user, pin, ip);
@@ -479,7 +585,7 @@ function createService(db, { adminPhone } = {}) {
       const src = await walletOf(user.id, from);
       if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${from}.`);
       const txId = await move({ type: 'request', fromAcc: src, toAcc: await ensureWallet(r.requester_id, r.currency),
-        quote: await requestQuote(user, r, from), note: r.note, createdBy: user.id, idemKey: key });
+        quote: await quoteOr(user, quoteId, 'request', `${r.id}|${from}`, () => requestQuote(user, r, from)), note: r.note, createdBy: user.id, idemKey: key });
       await db.run("UPDATE money_requests SET status = 'paid', tx_id = ? WHERE id = ?", txId, r.id);
       return txId;
     });
@@ -509,13 +615,13 @@ function createService(db, { adminPhone } = {}) {
     requireRole(agent, 'agent', 'admin');
     const customer = await findRecipient(agent, to);
     const from = homeCurrency(agent);
-    return {
+    return issueQuote(agent, 'cash_in', `${customer.id}|${customer.receive_currency}|${amount}`, {
       ...await buildQuote({ amount, from, to: customer.receive_currency, feeKind: feeKindBetween(agent, customer, from, customer.receive_currency) }),
       recipient: { name: customer.name, phone: customer.phone, country: customer.country },
-    };
+    });
   }
 
-  async function cashIn(agent, { to, amount, pin, idempotencyKey, expectedTo }, ip) {
+  async function cashIn(agent, { to, amount, pin, idempotencyKey, expectedTo, quoteId }, ip) {
     requireRole(agent, 'agent', 'admin');
     const customer = await findRecipient(agent, to);
     if (customer.id === agent.id) throw new ApiError(400, 'same_account', 'Não pode depositar na sua própria conta.');
@@ -523,9 +629,14 @@ function createService(db, { adminPhone } = {}) {
     const from = homeCurrency(agent);
     const res = await idempotent(agent, idempotencyKey, async (key) => {
       const toCur = customer.receive_currency;
-      return move({ type: 'cash_in', fromAcc: await ensureWallet(agent.id, from), toAcc: await ensureWallet(customer.id, toCur),
-        quote: await buildQuote({ amount, from, to: toCur, feeKind: feeKindBetween(agent, customer, from, toCur) }),
+      const txId = await move({ type: 'cash_in', fromAcc: await ensureWallet(agent.id, from), toAcc: await ensureWallet(customer.id, toCur),
+        quote: await quoteOr(agent, quoteId, 'cash_in', `${customer.id}|${toCur}|${amount}`,
+          () => buildQuote({ amount, from, to: toCur, feeKind: feeKindBetween(agent, customer, from, toCur) })),
         note: 'Depósito no agente ' + agent.name, createdBy: agent.id, idemKey: key, expectedTo });
+      const r = await rates();
+      const c = C.AGENT_COMMISSION;
+      await payCommission(agent, from, Math.min(Math.round(amount * c.cashInRate), fromEur(c.cashInMaxEur, from, r)), 'depósito');
+      return txId;
     });
     if (!res.replayed) await audit(agent.id, 'cash_in', { tx: res.transaction.id, customer: customer.id, amount }, ip);
     return res;
@@ -589,10 +700,25 @@ function createService(db, { adminPhone } = {}) {
         quote: await cashoutQuote(c.amount, c.currency, c.from_currency),
         note: 'Levantamento no agente ' + agent.name, createdBy: agent.id });
       await db.run("UPDATE cashout_codes SET status = 'used', agent_id = ?, tx_id = ? WHERE id = ?", agent.id, id, c.id);
+      const t = await db.get('SELECT fee, currency FROM transactions WHERE id = ?', id);
+      // A comissão é paga na moeda em que o agente trabalha.
+      const r = await rates();
+      const feeInAgentCur = t.currency === c.currency ? t.fee : Math.round(t.fee * r[c.currency] / r[t.currency]);
+      await payCommission(agent, c.currency, Math.round(feeInAgentCur * C.AGENT_COMMISSION.cashOutShare), 'levantamento');
       return id;
     });
+    afterCommit(txId);
     await audit(agent.id, 'cash_out', { tx: txId, customer: customer.id, amount: c.amount }, ip);
     return { transaction: await txView(txId, agent), pay_cash: c.amount, currency: c.currency, customer: { name: customer.name, phone: customer.phone } };
+  }
+
+  // Comissão do agente: a empresa paga-a a partir das taxas dessa moeda.
+  async function payCommission(agent, currency, amount, what) {
+    if (!amount || amount < 1 || agent.role !== 'agent') return null;
+    const fees = await internal('fees', currency);
+    const wallet = await ensureWallet(agent.id, currency);
+    return recordTx({ type: 'commission', fromAcc: fees, toAcc: wallet, amount, currency, toAmount: amount, toCurrency: currency,
+      note: `Comissão de ${what}`, createdBy: agent.id, credits: [[fees.id, -amount], [wallet.id, amount]] });
   }
 
   // ---------- Administração ----------
@@ -739,6 +865,9 @@ function createService(db, { adminPhone } = {}) {
       id: r.id, kind: r.kind, amount: r.amount, currency: r.currency, fee: r.fee, reference: r.reference,
       status: r.status, note: r.note, bank_reference: r.bank_reference, created_at: r.created_at, updated_at: r.updated_at,
       iban: r.iban ? formatIban(r.iban) : null, holder: r.holder, pay_to: company,
+      from_currency: r.from_currency || r.currency, from_amount: r.from_amount ?? r.amount,
+      beneficiary_phone: r.beneficiary_phone || null, third_party: !!(r.beneficiary_phone || (r.kind === 'withdrawal' && r.from_currency)),
+      provider: r.provider || 'manual', provider_status: r.provider_status || null,
     };
     if (forAdmin) {
       const u = await userById(r.user_id);
@@ -771,35 +900,68 @@ function createService(db, { adminPhone } = {}) {
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', id));
   }
 
-  async function quoteBankWithdrawal(user, { amount, currency }) {
-    const cur = needCurrency(currency || user.receive_currency);
-    const r = await rates();
-    return { amount, currency: cur, fee: feeFor('bankOut', amount, cur, r), total: amount + feeFor('bankOut', amount, cur, r), to_amount: amount, to_currency: cur, rate: 1 };
+  // =====================================================================
+  // PAGAMENTOS PARA CONTAS BANCÁRIAS (levantamentos e envios para IBAN)
+  // O cliente pode levantar para o seu IBAN ou ENVIAR para o IBAN de outra
+  // pessoa que ainda não tem DobraPay, noutra moeda (ex.: paga em EUR e chega
+  // em STN a uma conta no BISTP). O dinheiro sai logo da carteira para a
+  // conta interna "por pagar" da moeda de destino; quem paga é o admin
+  // (manual) ou um parceiro por API, que confirma por webhook.
+  // =====================================================================
+  const payoutKey = (from, dest, amount) => `${from}|${dest}|${amount}`;
+
+  async function quoteBankWithdrawal(user, { amount, currency, fromCurrency }) {
+    const dest = needCurrency(currency || user.receive_currency);
+    const from = needCurrency(fromCurrency || dest);
+    const q = await buildQuote({ from, to: dest, exactTo: amount, feeKind: 'bankOut' });
+    return issueQuote(user, 'payout', payoutKey(from, dest, amount), q);
   }
 
-  // Levantar para o banco: o dinheiro sai já da carteira para "por pagar".
-  async function createBankWithdrawal(user, { amount, currency, iban, holder, pin, idempotencyKey }, ip) {
-    const cur = needCurrency(currency || user.receive_currency);
+  async function createBankWithdrawal(user, { amount, currency, fromCurrency, iban, holder, beneficiaryPhone, saveBeneficiary,
+    pin, idempotencyKey, quoteId }, ip) {
+    const dest = needCurrency(currency || user.receive_currency);
+    const from = needCurrency(fromCurrency || dest);
     const ib = normalizeIban(iban || '');
     if (!ib) throw new ApiError(400, 'bad_iban', 'IBAN inválido. Confirme os dígitos (ex.: PT50 0000 0000 0000 0000 0000 0).');
-    const h = cleanText(holder, 80) || user.name;
-    if (!(await db.get('SELECT 1 AS x FROM company_bank_accounts WHERE currency = ?', cur))) {
-      throw new ApiError(409, 'no_bank', `Ainda não é possível levantar em ${cur} por transferência. Use um agente.`);
+    if (!Number.isSafeInteger(amount) || amount < 1) throw new ApiError(400, 'bad_amount', 'Valor inválido.');
+    let phone = null;
+    if (beneficiaryPhone) {
+      phone = normalizePhone(beneficiaryPhone, user.country);
+      if (!phone) throw new ApiError(400, 'bad_phone', 'Número do beneficiário inválido.');
+    }
+    const own = await db.get('SELECT * FROM user_bank_accounts WHERE user_id = ?', user.id);
+    const h = cleanText(holder, 80) || (own && own.iban === ib ? own.holder : null) || (phone ? null : user.name);
+    if (!h) throw new ApiError(400, 'bad_holder', 'Indique o nome do titular da conta.');
+    if (!(await db.get('SELECT 1 AS x FROM company_bank_accounts WHERE currency = ?', dest))) {
+      throw new ApiError(409, 'no_bank', `Ainda não é possível pagar em ${dest} para contas bancárias. Use um agente.`);
     }
     await checkPin(user, pin, ip);
     const ref = await uniqueReference('LV');
     const res = await idempotent(user, idempotencyKey, async (key) => {
-      const src = await walletOf(user.id, cur);
-      if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${cur}.`);
-      const quote = await buildQuote({ amount, from: cur, to: cur, feeKind: 'bankOut' });
-      const txId = await move({ type: 'bank_out', fromAcc: src, toAcc: await internal('payout', cur), quote,
-        note: `Levantamento para ${formatIban(ib)} (${ref})`, createdBy: user.id, idemKey: key });
-      await db.run(`INSERT INTO bank_requests (user_id, kind, amount, currency, fee, reference, iban, holder, tx_id, created_at, updated_at)
-                    VALUES (?, 'withdrawal', ?, ?, ?, ?, ?, ?, ?, ?, ?)`, user.id, amount, cur, quote.fee, ref, ib, h, txId, now(), now());
+      const src = await walletOf(user.id, from);
+      if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${from}.`);
+      const quote = quoteId
+        ? await takeQuote(user, quoteId, 'payout', payoutKey(from, dest, amount))
+        : await buildQuote({ from, to: dest, exactTo: amount, feeKind: 'bankOut' });
+      const txId = await move({ type: 'bank_out', fromAcc: src, toAcc: await internal('payout', dest), quote,
+        note: `${phone || h !== user.name ? 'Envio para ' + h : 'Levantamento'} · ${formatIban(ib)} (${ref})`, createdBy: user.id, idemKey: key });
+      await db.run(`INSERT INTO bank_requests (user_id, kind, amount, currency, fee, reference, iban, holder, tx_id, from_currency, from_amount,
+                    beneficiary_phone, created_at, updated_at) VALUES (?, 'withdrawal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      user.id, amount, dest, quote.fee, ref, ib, h, txId, from === dest ? null : from, quote.amount, phone, now(), now());
       return txId;
     });
-    const req = await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', res.transaction.id);
-    if (!res.replayed) await audit(user.id, 'bank_withdrawal_request', { id: req.id, amount, cur }, ip);
+    let req = await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', res.transaction.id);
+    if (!res.replayed) {
+      await audit(user.id, 'bank_withdrawal_request', { id: req.id, amount, dest, from, third_party: !!phone }, ip);
+      // Guarda o beneficiário (só para este cliente) para a próxima vez.
+      if (h !== user.name && saveBeneficiary !== false) {
+        await db.run(`INSERT INTO beneficiaries (owner_id, name, iban, currency, phone, created_at, last_used) VALUES (?, ?, ?, ?, ?, ?, ?)
+                      ON CONFLICT (owner_id, iban) DO UPDATE SET name = excluded.name, currency = excluded.currency, phone = excluded.phone, last_used = excluded.last_used`,
+        user.id, h, ib, dest, phone, now(), now());
+      }
+      await dispatchPayout(req);
+      req = await db.get('SELECT * FROM bank_requests WHERE id = ?', req.id);
+    }
     return { ...res, request: await bankRequestView(req) };
   }
 
@@ -808,14 +970,18 @@ function createService(db, { adminPhone } = {}) {
     return Promise.all(rows.map((r) => bankRequestView(r)));
   }
 
-  // Devolve à carteira um levantamento que não vai ser pago (valor + taxa).
+  // Devolve à carteira um pagamento que não vai ser feito (valor + taxa), na
+  // moeda de origem e ao mesmo câmbio, por isso o cliente recebe tudo de volta.
   async function refundWithdrawal(r, actorId, why) {
-    const wallet = await ensureWallet(r.user_id, r.currency);
+    const from = r.from_currency || r.currency;
+    const srcAmount = r.from_amount ?? r.amount;
+    const wallet = await ensureWallet(r.user_id, from);
     const payout = await internal('payout', r.currency);
-    const credits = [[payout.id, -r.amount], [wallet.id, r.amount + r.fee]];
-    if (r.fee) credits.push([(await internal('fees', r.currency)).id, -r.fee]);
-    return recordTx({ type: 'refund', fromAcc: payout, toAcc: wallet, amount: r.amount + r.fee, currency: r.currency,
-      toAmount: r.amount + r.fee, toCurrency: r.currency, note: why, createdBy: actorId, credits });
+    const credits = [[payout.id, -r.amount], [wallet.id, srcAmount + r.fee]];
+    if (from !== r.currency) credits.push([(await internal('fx', r.currency)).id, r.amount], [(await internal('fx', from)).id, -srcAmount]);
+    if (r.fee) credits.push([(await internal('fees', from)).id, -r.fee]);
+    return recordTx({ type: 'refund', fromAcc: payout, toAcc: wallet, amount: r.amount, currency: r.currency,
+      toAmount: srcAmount + r.fee, toCurrency: from, note: why, createdBy: actorId, credits });
   }
 
   async function lockedRequest(id, extra = '') {
@@ -828,8 +994,9 @@ function createService(db, { adminPhone } = {}) {
   async function cancelBankRequest(user, id, ip) {
     const out = await db.tx(async () => {
       const r = await lockedRequest(id, ` AND user_id = ${Number(user.id)}`);
+      if (r.provider_status === 'submitted') throw new ApiError(409, 'already_sent', 'Este pagamento já foi enviado ao banco e não pode ser cancelado.');
       let txId = null;
-      if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, user.id, `Levantamento cancelado (${r.reference})`);
+      if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, user.id, `Pagamento cancelado (${r.reference})`);
       await db.run("UPDATE bank_requests SET status = 'cancelled', final_tx_id = ?, updated_at = ? WHERE id = ?", txId, now(), r.id);
       return r.id;
     });
@@ -860,25 +1027,37 @@ function createService(db, { adminPhone } = {}) {
         received, cleanText(bankReference, 80), t, admin.id, now(), r.id);
       return t;
     });
+    afterCommit(txId);
     await audit(admin.id, 'bank_deposit_confirmed', { id, tx: txId }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE tx_id = ?', txId), { forAdmin: true });
   }
 
-  // O admin já fez a transferência para o IBAN do cliente.
+  // O dinheiro real saiu do banco da empresa: fecha o pagamento.
+  async function finishPayout(r, actorId, bankReference, handledBy) {
+    const payout = await internal('payout', r.currency), float = await internal('system_float', r.currency);
+    const t = await recordTx({ type: 'bank_out', fromAcc: payout, toAcc: float, amount: r.amount, currency: r.currency,
+      toAmount: r.amount, toCurrency: r.currency, note: `Pago ao banco (${r.reference})`, createdBy: actorId,
+      credits: [[payout.id, -r.amount], [float.id, r.amount]] });
+    await db.run("UPDATE bank_requests SET status = 'completed', bank_reference = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
+      bankReference, t, handledBy ?? null, now(), r.id);
+    return t;
+  }
+
+  async function rejectRequestCore(r, actorId, why, handledBy) {
+    let txId = null;
+    if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, actorId, `Pagamento recusado: ${why}`);
+    await db.run("UPDATE bank_requests SET status = 'rejected', note = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
+      why, txId, handledBy ?? null, now(), r.id);
+    return txId;
+  }
+
+  // O admin já fez a transferência para o IBAN.
   async function completeBankWithdrawal(admin, id, { bankReference, pin }, ip) {
     requireRole(admin, 'admin');
     const ref = cleanText(bankReference, 80);
     if (!ref) throw new ApiError(400, 'bad_reference', 'Indique a referência da transferência feita no banco.');
     await checkPin(admin, pin, ip);
-    await db.tx(async () => {
-      const r = await lockedRequest(id, " AND kind = 'withdrawal'");
-      const payout = await internal('payout', r.currency), float = await internal('system_float', r.currency);
-      const t = await recordTx({ type: 'bank_out', fromAcc: payout, toAcc: float, amount: r.amount, currency: r.currency,
-        toAmount: r.amount, toCurrency: r.currency, note: `Pago ao banco (${r.reference})`, createdBy: admin.id,
-        credits: [[payout.id, -r.amount], [float.id, r.amount]] }); // o dinheiro real saiu do banco da empresa
-      await db.run("UPDATE bank_requests SET status = 'completed', bank_reference = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
-        ref, t, admin.id, now(), r.id);
-    });
+    afterCommit(await db.tx(async () => finishPayout(await lockedRequest(id, " AND kind = 'withdrawal'"), admin.id, ref, admin.id)));
     await audit(admin.id, 'bank_withdrawal_paid', { id }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', Number(id)), { forAdmin: true });
   }
@@ -888,15 +1067,96 @@ function createService(db, { adminPhone } = {}) {
     const why = cleanText(reason, 140);
     if (!why) throw new ApiError(400, 'bad_reason', 'Indique o motivo (o cliente vai vê-lo).');
     await checkPin(admin, pin, ip);
-    await db.tx(async () => {
-      const r = await lockedRequest(id);
-      let txId = null;
-      if (r.kind === 'withdrawal') txId = await refundWithdrawal(r, admin.id, `Levantamento recusado: ${why}`);
-      await db.run("UPDATE bank_requests SET status = 'rejected', note = ?, final_tx_id = ?, handled_by = ?, updated_at = ? WHERE id = ?",
-        why, txId, admin.id, now(), r.id);
-    });
+    afterCommit(await db.tx(async () => rejectRequestCore(await lockedRequest(id), admin.id, why, admin.id)));
     await audit(admin.id, 'bank_request_rejected', { id, why }, ip);
     return bankRequestView(await db.get('SELECT * FROM bank_requests WHERE id = ?', Number(id)), { forAdmin: true });
+  }
+
+  // ---------- Parceiros de pagamento ----------
+  async function providerFor(currency) {
+    const row = await db.get('SELECT provider FROM payout_providers WHERE currency = ?', currency);
+    const name = row ? row.provider : 'manual';
+    return providers[name] && providers[name].send ? name : 'manual';
+  }
+
+  // Envia a ordem ao parceiro (se a moeda tiver um). Se o parceiro falhar,
+  // o pedido fica para pagamento manual, sem perder dinheiro.
+  async function dispatchPayout(r) {
+    const name = await providerFor(r.currency);
+    if (name === 'manual') return;
+    try {
+      const { externalId } = await providers[name].send({ reference: r.reference, amount: r.amount, currency: r.currency, iban: r.iban, holder: r.holder });
+      await db.run("UPDATE bank_requests SET provider = ?, external_id = ?, provider_status = 'submitted', updated_at = ? WHERE id = ? AND status = 'pending'",
+        name, externalId, now(), r.id);
+      await audit(null, 'payout_submitted', { id: r.id, provider: name, externalId });
+    } catch (err) {
+      await db.run("UPDATE bank_requests SET provider = ?, provider_status = 'error', note = ?, updated_at = ? WHERE id = ?",
+        name, cleanText('Falha ao enviar ao parceiro (pagar manualmente): ' + err.message, 140), now(), r.id);
+      await audit(null, 'payout_dispatch_failed', { id: r.id, provider: name, error: err.message });
+    }
+  }
+
+  // Confirmação do parceiro (webhook ou simulador). Repetições são ignoradas.
+  async function handlePayoutEvent(provider, { external_id: externalId, status, reason, bank_reference: bankRef } = {}) {
+    if (!externalId || !['paid', 'failed'].includes(status)) throw new ApiError(400, 'bad_event', 'Evento inválido: precisa de external_id e status (paid/failed).');
+    const result = await db.tx(async () => {
+      const r = await db.get('SELECT * FROM bank_requests WHERE provider = ? AND external_id = ? FOR UPDATE', provider, String(externalId));
+      if (!r) throw new ApiError(404, 'not_found', 'Pagamento desconhecido.');
+      if (r.status !== 'pending') return { id: r.id, status: r.status, duplicate: true };
+      await db.run('UPDATE bank_requests SET provider_status = ? WHERE id = ?', status, r.id);
+      const txId = status === 'paid'
+        ? await finishPayout(r, r.user_id, cleanText(bankRef, 80) || String(externalId), null)
+        : await rejectRequestCore(r, r.user_id, cleanText(reason, 120) || 'o banco recusou a transferência', null);
+      return { id: r.id, status: status === 'paid' ? 'completed' : 'rejected', txId };
+    });
+    if (!result.duplicate) afterCommit(result.txId);
+    delete result.txId;
+    await audit(null, 'payout_event', { provider, externalId, status, result });
+    return result;
+  }
+
+  async function listPayoutProviders(admin) {
+    requireRole(admin, 'admin');
+    const rows = Object.fromEntries((await db.all('SELECT currency, provider FROM payout_providers')).map((x) => [x.currency, x.provider]));
+    return {
+      available: Object.entries(providers).map(([id, p]) => ({ id, label: p.label })),
+      currencies: Object.keys(C.CURRENCIES).map((cur) => ({ currency: cur, provider: rows[cur] && providers[rows[cur]] ? rows[cur] : 'manual' })),
+    };
+  }
+
+  async function setPayoutProvider(admin, { currency, provider, pin }, ip) {
+    requireRole(admin, 'admin');
+    needCurrency(currency);
+    if (!providers[provider]) throw new ApiError(400, 'bad_provider', 'Parceiro desconhecido.');
+    await checkPin(admin, pin, ip);
+    await db.run(`INSERT INTO payout_providers (currency, provider, updated_at, updated_by) VALUES (?, ?, ?, ?)
+                  ON CONFLICT (currency) DO UPDATE SET provider = excluded.provider, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+    currency, provider, now(), admin.id);
+    await audit(admin.id, 'set_payout_provider', { currency, provider }, ip);
+    return listPayoutProviders(admin);
+  }
+
+  // ---------- Beneficiários e IBAN próprio ----------
+  async function listBeneficiaries(user) {
+    const rows = await db.all('SELECT * FROM beneficiaries WHERE owner_id = ? ORDER BY last_used DESC LIMIT 50', user.id);
+    return rows.map((b) => ({ id: b.id, name: b.name, iban: formatIban(b.iban), currency: b.currency, phone: b.phone }));
+  }
+  async function deleteBeneficiary(user, id) {
+    await db.run('DELETE FROM beneficiaries WHERE id = ? AND owner_id = ?', Number(id) || 0, user.id);
+    return listBeneficiaries(user);
+  }
+  async function getMyBankAccount(user) {
+    const b = await db.get('SELECT * FROM user_bank_accounts WHERE user_id = ?', user.id);
+    return b ? { iban: formatIban(b.iban), holder: b.holder } : null;
+  }
+  async function setMyBankAccount(user, { iban, holder }) {
+    if (!iban) { await db.run('DELETE FROM user_bank_accounts WHERE user_id = ?', user.id); return null; }
+    const ib = normalizeIban(iban);
+    if (!ib) throw new ApiError(400, 'bad_iban', 'IBAN inválido. Confirme os dígitos.');
+    await db.run(`INSERT INTO user_bank_accounts (user_id, iban, holder, updated_at) VALUES (?, ?, ?, ?)
+                  ON CONFLICT (user_id) DO UPDATE SET iban = excluded.iban, holder = excluded.holder, updated_at = excluded.updated_at`,
+    user.id, ib, cleanText(holder, 80) || user.name, now());
+    return getMyBankAccount(user);
   }
 
   // ---------- Acerto entre bancos ----------
@@ -1030,12 +1290,12 @@ function createService(db, { adminPhone } = {}) {
     const view = await chargeView(c, user);
     if (view.status === 'pending' && user.id !== c.merchant_id) {
       const from = needCurrency(fromCurrency || user.receive_currency);
-      view.quote = await buildQuote({ from, to: c.currency, exactTo: c.amount, feeKind: 'merchant' });
+      view.quote = await issueQuote(user, 'charge', `${c.id}|${from}`, await buildQuote({ from, to: c.currency, exactTo: c.amount, feeKind: 'merchant' }));
     }
     return view;
   }
 
-  async function payCharge(user, code, { fromCurrency, pin, idempotencyKey }, ip) {
+  async function payCharge(user, code, { fromCurrency, pin, idempotencyKey, quoteId }, ip) {
     const c0 = await findCharge(code);
     if (c0.merchant_id === user.id) throw new ApiError(400, 'same_account', 'Não pode pagar a sua própria cobrança.');
     const from = needCurrency(fromCurrency || user.receive_currency);
@@ -1049,7 +1309,7 @@ function createService(db, { adminPhone } = {}) {
       if (!src) throw new ApiError(402, 'insufficient_funds', `Não tem saldo em ${from}.`);
       const m = await userById(c.merchant_id);
       const txId = await move({ type: 'merchant', fromAcc: src, toAcc: await ensureWallet(c.merchant_id, c.currency),
-        quote: await buildQuote({ from, to: c.currency, exactTo: c.amount, feeKind: 'merchant' }),
+        quote: await quoteOr(user, quoteId, 'charge', `${c.id}|${from}`, () => buildQuote({ from, to: c.currency, exactTo: c.amount, feeKind: 'merchant' })),
         note: c.description || `Pagamento em ${m.merchant_name}`, createdBy: user.id, idemKey: key });
       await db.run("UPDATE charges SET status = 'paid', payer_id = ?, tx_id = ? WHERE id = ?", user.id, txId, c.id);
       return txId;
@@ -1076,13 +1336,29 @@ function createService(db, { adminPhone } = {}) {
     return merchantCharge(merchant, id);
   }
 
+  // Ferramentas internas partilhadas com as funcionalidades extra (src/features/*).
+  const kit = {
+    db, C, rates, toEur, fromEur, fmt, now, startOfDay, audit, events, afterCommitHooks, afterCommit,
+    userById, userByPhone, walletOf, walletsOf, ensureWallet, internal, accountById, homeCurrency, findRecipient,
+    checkPin, requireRole, needCurrency, buildQuote, move, recordTx, idempotent, txView, transfer, publicUser,
+    limitsFor, sentTodayEur, createCashoutCode, history, OUTGOING, env, pushSender,
+    newSessionFor: async (u) => ({ token: await newSession(u.id), user: await publicUser(u) }),
+  };
+  const extra = {};
+  for (const name of ['push', 'kyc', 'aml', 'passkeys', 'scheduled', 'bills', 'agents', 'ussd', 'receipts', 'cards']) {
+    Object.assign(extra, require('./features/' + name)(kit));
+  }
+
   return {
+    ...extra,
+    requestOtp, resetPin, payCommission,
     register, login, logout, userFromToken, publicUser, changePin, setReceiveCurrency, lookup,
     quoteTransfer, quoteExchange, quoteRequest, quoteCashIn, quoteCashout,
     transfer, exchange, history, createRequest, listRequests, payRequest, closeRequest,
     cashIn, createCashoutCode, redeemCashout, issueFloat, listRates, setRate, setRole, listUsers, stats, ledgerCheck,
     listCompanyBankAccounts, setCompanyBankAccount, createBankDeposit, quoteBankWithdrawal, createBankWithdrawal, listMyBankRequests,
     cancelBankRequest, adminListBankRequests, confirmBankDeposit, completeBankWithdrawal, rejectBankRequest, settlementView, recordSettlement, setLiquidityLimit,
+    handlePayoutEvent, listPayoutProviders, setPayoutProvider, listBeneficiaries, deleteBeneficiary, getMyBankAccount, setMyBankAccount,
     createCharge, getCharge, payCharge, merchantCharge, listMerchantCharges, cancelCharge,
   };
 }

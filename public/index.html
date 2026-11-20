@@ -19,25 +19,33 @@
       <h1>DobraPay</h1>
       <p>Envie e receba dinheiro entre São Tomé e Príncipe, Angola, Cabo Verde, Portugal e Espanha, em qualquer moeda.</p>
     </div>
+    <div class="lang-row"><select id="langSelect" aria-label="Idioma"></select></div>
     <div class="tabs" role="tablist">
-      <button type="button" role="tab" data-tab="login" class="active">Entrar</button>
-      <button type="button" role="tab" data-tab="register">Criar conta</button>
+      <button type="button" role="tab" data-tab="login" class="active" data-i18n="Entrar">Entrar</button>
+      <button type="button" role="tab" data-tab="register" data-i18n="Criar conta">Criar conta</button>
     </div>
     <form id="authForm" class="card" novalidate>
-      <label>País
+      <h3 data-only="reset" hidden style="margin-top:0" data-i18n="Recuperar o PIN">Recuperar o PIN</h3>
+      <label><span data-i18n="País">País</span>
         <select name="country" id="authCountry"></select>
       </label>
-      <label>Número de telemóvel
+      <label><span data-i18n="Número de telemóvel">Número de telemóvel</span>
         <div class="phone"><span id="authDial">+239</span><input name="phone" inputmode="tel" autocomplete="tel-national" placeholder="991 2345" required></div>
       </label>
-      <label data-only="register" hidden>Nome completo
+      <label data-only="register" hidden><span data-i18n="Nome completo">Nome completo</span>
         <input name="name" autocomplete="name" maxlength="60" placeholder="Ex.: Maria da Graça">
       </label>
-      <label>PIN (4 a 6 dígitos)
+      <label data-only="code" hidden><span data-i18n="Código recebido por SMS">Código recebido por SMS</span>
+        <input name="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" class="code-input">
+      </label>
+      <p class="who" data-devcode hidden></p>
+      <label data-only="pin"><span data-pinlabel data-i18n="PIN (4 a 6 dígitos)">PIN (4 a 6 dígitos)</span>
         <input name="pin" type="password" inputmode="numeric" pattern="\d*" maxlength="6" autocomplete="current-password" required>
       </label>
-      <p class="hint" data-only="register" hidden>Nunca partilhe o seu PIN, nem com agentes nem com funcionários.</p>
+      <p class="hint" data-only="register" hidden data-i18n="Nunca partilhe o seu PIN, nem com agentes nem com funcionários.">Nunca partilhe o seu PIN, nem com agentes nem com funcionários.</p>
       <button class="btn primary" type="submit">Entrar</button>
+      <button type="button" class="btn" data-passkey-login hidden style="width:100%;margin-top:10px">🙂 <span data-i18n="Entrar com Face ID / impressão digital">Entrar com Face ID / impressão digital</span></button>
+      <p class="center" style="margin:14px 0 0"><a href="#" data-forgot data-i18n="Esqueci o PIN">Esqueci o PIN</a><a href="#" data-backlogin hidden data-i18n="Voltar a entrar">Voltar a entrar</a></p>
     </form>
   </main>
 
@@ -66,6 +74,7 @@
       <button type="button" data-open="topup"><span>＋</span>Carregar</button>
       <button type="button" data-open="withdraw"><span>💵</span>Levantar</button>
       <button type="button" data-open="exchange"><span>⇄</span>Câmbio</button>
+      <button type="button" data-open="bills"><span>💡</span>Contas</button>
     </nav>
 
     <section id="merchantBar" class="role-bar" hidden>
@@ -77,14 +86,20 @@
       <strong>Agente</strong>
       <button type="button" class="btn small" data-open="cashin">Depósito de cliente</button>
       <button type="button" class="btn small" data-open="redeem">Levantamento de cliente</button>
+      <button type="button" class="btn small" data-open="agentProfile">O meu ponto</button>
+      <button type="button" class="btn small" data-open="agentStats">Comissões</button>
     </section>
     <section id="adminBar" class="role-bar" hidden>
       <strong>Admin</strong>
       <button type="button" class="btn small" data-open="admin">Painel</button>
       <button type="button" class="btn small" data-open="float">Emitir float</button>
       <button type="button" class="btn small" data-open="rates">Câmbios</button>
-      <button type="button" class="btn small" data-open="bankAdmin">Banco <span id="bankBadge"></span></button>
+      <button type="button" class="btn small" data-open="bankAdmin">Banco <span id="bankBadge" class="badge"></span></button>
       <button type="button" class="btn small" data-open="settlement">Acertos</button>
+      <button type="button" class="btn small" data-open="kycAdmin">Identidade <span id="kycBadge" class="badge"></span></button>
+      <button type="button" class="btn small" data-open="alerts">Alertas <span id="alertBadge" class="badge"></span></button>
+      <button type="button" class="btn small" data-open="reports">Relatórios</button>
+      <button type="button" class="btn small" data-open="ussdSim">USSD</button>
     </section>
 
     <section id="pending"></section>
@@ -108,6 +123,7 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -24,3 +24,14 @@ services:
       # O seu número, com indicativo (ex.: +2399900000): fica administrador.
       - key: ADMIN_PHONE
         sync: false
+      # Segredo para os webhooks dos parceiros de pagamento (gerado pelo Render).
+      - key: PAYOUT_WEBHOOK_SECRET
+        generateValue: true
+      # Chave para o gateway USSD da operadora (gerada pelo Render).
+      - key: USSD_SECRET
+        generateValue: true
+      # Carregar com cartão (Stripe): chave secreta (sk_test_… / sk_live_…) e segredo do webhook (whsec_…).
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false

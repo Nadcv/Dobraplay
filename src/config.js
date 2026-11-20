@@ -46,7 +46,8 @@ module.exports = {
     exchange: () => 0,                                                          // trocar entre as próprias carteiras: só a margem de câmbio
     bankIn: () => 0,                                                            // carregar por transferência bancária: grátis
     bankOut: (eur) => Math.min(Math.max(Math.round(eur * 0.01), 50), 5 * EUR),  // levantar para o banco: 1% (mín. 0,50 €, máx. 5 €)
-    merchant: () => 0,                                                          // pagar numa loja: grátis para o cliente (só a margem se houver câmbio)
+    merchant: () => 0,
+    cardIn: (eur) => Math.round(eur * 0.015) + 25,                              // carregar com cartão: 1,5% + 0,25 € (cobre a taxa da Stripe)                                                          // pagar numa loja: grátis para o cliente (só a margem se houver câmbio)
   },
 
   MIN_AMOUNT: 1, // 1 cêntimo (valida-se também pelo mínimo em euros abaixo)
@@ -57,5 +58,26 @@ module.exports = {
   CASHOUT_CODE_MINUTES: 30,
   CASHOUT_CODE_MAX_ATTEMPTS: 5,
   CHARGE_MINUTES: 15,      // validade de uma cobrança de loja (QR)
+  QUOTE_SECONDS: 60,       // câmbio garantido durante 60 s depois de o cliente ver a cotação
+  OTP_MINUTES: 10,         // validade do código enviado por SMS
+  OTP_MAX_ATTEMPTS: 5,     // tentativas por código
+  OTP_MAX_PER_HOUR: 5,     // SMS por número por hora (evita abusos e custos)
+
+  // Comissões dos agentes (pagas pela empresa, a partir das taxas):
+  AGENT_COMMISSION: {
+    cashInRate: 0.003,     // 0,3% de cada depósito feito no agente
+    cashInMaxEur: 300,     // até 3 € por depósito
+    cashOutShare: 0.4,     // 40% da taxa de levantamento vai para o agente
+  },
+
+  // Alertas automáticos (valores em cêntimos de euro).
+  AML: {
+    largeTxEur: 100_000,         // operação de 1 000 € ou mais
+    velocityCount: 10,           // mais de 10 envios numa hora
+    structuringRatio: 0.9,       // 3+ envios de 90–100% do limite por operação em 24 h
+    newAccountDays: 7,           // conta com menos de 7 dias…
+    newAccountEur: 50_000,       // …que envia mais de 500 € em 24 h
+    fanInSenders: 5,             // 5+ pessoas diferentes a enviar para a mesma conta em 24 h
+  },
   BANK_DEPOSIT_DAYS: 7,    // pedido de carregamento por transferência fica aberto 7 dias
 };

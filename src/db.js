@@ -22,7 +22,8 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { CURRENCIES } = require('./config');
 
-const SCHEMA_VERSION = 4; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + pagamentos em lojas
+const SCHEMA_VERSION = 6; // 6 = SMS, identidade, alertas, push, passkeys, envios automáticos, contas, agentes
+const _V5 = 5; // 3 = SQLite + PostgreSQL; 4 = transferências bancárias + lojas; 5 = parceiros de pagamento, câmbio garantido, envios para IBAN
 
 // Escrito para SQLite; para PostgreSQL os tipos são convertidos em pgSchema().
 const SCHEMA = `
@@ -68,7 +69,7 @@ const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS transactions (
     id               TEXT PRIMARY KEY,
-    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund')),
+    type             TEXT NOT NULL CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission','card_in')),
     from_account     INTEGER NOT NULL REFERENCES accounts(id),
     to_account       INTEGER NOT NULL REFERENCES accounts(id),
     amount           INTEGER NOT NULL CHECK (amount > 0),     -- na moeda de origem
@@ -152,6 +153,12 @@ const SCHEMA = `
     holder          TEXT,
     status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','rejected','cancelled')),
     bank_reference  TEXT,                          -- referência do movimento no extrato do banco
+    from_currency   TEXT,                          -- envio para IBAN com câmbio: moeda de origem (NULL = igual a currency)
+    from_amount     INTEGER,                       -- valor que saiu da carteira (sem a taxa)
+    beneficiary_phone TEXT,                        -- envio para outra pessoa: telefone dela (opcional)
+    provider        TEXT,                          -- parceiro que faz o pagamento (NULL = manual)
+    external_id     TEXT,                          -- identificador da ordem no parceiro
+    provider_status TEXT,                          -- submitted / paid / failed
     note            TEXT,
     tx_id           TEXT REFERENCES transactions(id),
     final_tx_id     TEXT REFERENCES transactions(id),
@@ -160,6 +167,49 @@ const SCHEMA = `
     updated_at      INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS bank_req_status ON bank_requests(status, kind);
+
+  -- Como são pagos os levantamentos de cada moeda: 'manual' (o admin faz a
+  -- transferência) ou um parceiro por API ('sandbox' = simulador de testes).
+  CREATE TABLE IF NOT EXISTS payout_providers (
+    currency    TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    updated_by  INTEGER
+  );
+
+  -- Cotações com câmbio garantido durante alguns segundos (usadas uma só vez).
+  CREATE TABLE IF NOT EXISTS quotes (
+    id          TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    kind        TEXT NOT NULL,                    -- transfer, exchange, cash_in, request, charge, payout
+    qkey        TEXT NOT NULL,                    -- o que foi cotado (destinatário, moedas, valor…)
+    data        TEXT NOT NULL,                    -- valores da cotação (JSON)
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    created_at  INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS quotes_expires ON quotes(expires_at);
+
+  -- Beneficiários bancários de cada cliente (privados: só quem os guardou os vê).
+  CREATE TABLE IF NOT EXISTS beneficiaries (
+    id          INTEGER PRIMARY KEY,
+    owner_id    INTEGER NOT NULL REFERENCES users(id),
+    name        TEXT NOT NULL,
+    iban        TEXT NOT NULL,
+    currency    TEXT NOT NULL,
+    phone       TEXT,
+    created_at  INTEGER NOT NULL,
+    last_used   INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS beneficiaries_owner_iban ON beneficiaries(owner_id, iban);
+
+  -- IBAN do próprio cliente (para levantar sem o escrever de cada vez).
+  CREATE TABLE IF NOT EXISTS user_bank_accounts (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id),
+    iban        TEXT NOT NULL,
+    holder      TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+  );
 
   -- Cobranças de lojas: a loja gera um QR, o cliente paga.
   CREATE TABLE IF NOT EXISTS charges (
@@ -186,6 +236,146 @@ const SCHEMA = `
     updated_at     INTEGER NOT NULL,
     updated_by     INTEGER
   );
+
+  -- Códigos de verificação por SMS (registo e recuperar o PIN).
+  CREATE TABLE IF NOT EXISTS otp_codes (
+    id          INTEGER PRIMARY KEY,
+    phone       TEXT NOT NULL,
+    purpose     TEXT NOT NULL,                    -- register / reset_pin
+    code_hash   TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    created_at  INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS otp_phone ON otp_codes(phone, purpose, created_at);
+
+  -- Verificação de identidade (nível 2): documento + selfie, revisto pelo admin.
+  CREATE TABLE IF NOT EXISTS kyc_requests (
+    id            INTEGER PRIMARY KEY,
+    user_id       INTEGER NOT NULL REFERENCES users(id),
+    full_name     TEXT NOT NULL,
+    doc_type      TEXT NOT NULL,                  -- bi, passaporte, autorizacao_residencia
+    doc_number    TEXT NOT NULL,
+    birth_date    TEXT NOT NULL,
+    doc_image     TEXT NOT NULL,                  -- imagem JPEG em data URL (reduzida no telemóvel)
+    selfie_image  TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+    note          TEXT,
+    reviewed_by   INTEGER REFERENCES users(id),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS kyc_status ON kyc_requests(status, created_at);
+
+  -- Alertas automáticos antifraude / branqueamento de capitais.
+  CREATE TABLE IF NOT EXISTS aml_alerts (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id),
+    rule         TEXT NOT NULL,
+    detail       TEXT NOT NULL,
+    tx_id        TEXT REFERENCES transactions(id),
+    status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+    note         TEXT,
+    reviewed_by  INTEGER REFERENCES users(id),
+    created_at   INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS aml_status ON aml_alerts(status, created_at);
+
+  -- Subscrições de notificações push (uma por telemóvel/navegador).
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint    TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    p256dh      TEXT NOT NULL,
+    auth        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+  );
+
+  -- Passkeys (Face ID / impressão digital) para entrar sem o PIN.
+  CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id          TEXT PRIMARY KEY,                 -- identificador da credencial (base64url)
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    public_key  TEXT NOT NULL,                    -- base64url
+    counter     INTEGER NOT NULL DEFAULT 0,
+    transports  TEXT,
+    label       TEXT,
+    created_at  INTEGER NOT NULL,
+    last_used   INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS webauthn_challenges (
+    id          TEXT PRIMARY KEY,
+    user_id     INTEGER,
+    challenge   TEXT NOT NULL,
+    purpose     TEXT NOT NULL,                    -- register / login
+    expires_at  INTEGER NOT NULL
+  );
+
+  -- Envios automáticos todos os meses (ex.: mesada).
+  CREATE TABLE IF NOT EXISTS scheduled_transfers (
+    id             INTEGER PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id),
+    to_phone       TEXT NOT NULL,
+    amount         INTEGER NOT NULL CHECK (amount > 0),
+    from_currency  TEXT NOT NULL,
+    note           TEXT,
+    day_of_month   INTEGER NOT NULL CHECK (day_of_month BETWEEN 1 AND 28),
+    next_run_at    INTEGER NOT NULL,
+    failures       INTEGER NOT NULL DEFAULT 0,
+    active         INTEGER NOT NULL DEFAULT 1,
+    last_status    TEXT,
+    last_run_at    INTEGER,
+    created_at     INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS sched_due ON scheduled_transfers(active, next_run_at);
+
+  -- Recargas de telemóvel e pagamento de contas (luz, água).
+  CREATE TABLE IF NOT EXISTS bill_payments (
+    id            INTEGER PRIMARY KEY,
+    user_id       INTEGER NOT NULL REFERENCES users(id),
+    biller        TEXT NOT NULL,
+    account_ref   TEXT NOT NULL,                  -- número de telemóvel, contador ou referência da fatura
+    amount        INTEGER NOT NULL CHECK (amount > 0),
+    currency      TEXT NOT NULL,
+    from_currency TEXT NOT NULL,
+    from_amount   INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','failed')),
+    token         TEXT,                           -- ex.: código de energia pré-paga
+    provider_ref  TEXT,
+    note          TEXT,
+    tx_id         TEXT REFERENCES transactions(id),
+    final_tx_id   TEXT REFERENCES transactions(id),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+
+  -- Perfil público dos agentes (para o mapa "agentes perto de mim").
+  CREATE TABLE IF NOT EXISTS agent_profiles (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id),
+    business    TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    hours       TEXT,
+    lat         REAL NOT NULL,
+    lng         REAL NOT NULL,
+    cash_available INTEGER NOT NULL DEFAULT 1,
+    updated_at  INTEGER NOT NULL
+  );
+
+  -- Carregamentos com cartão (Stripe Checkout). A DobraPay nunca vê o cartão:
+  -- o cliente paga na página da Stripe e a Stripe confirma por webhook.
+  CREATE TABLE IF NOT EXISTS card_topups (
+    id              TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    amount          INTEGER NOT NULL CHECK (amount > 0),   -- o que entra na carteira
+    fee             INTEGER NOT NULL DEFAULT 0,            -- taxa do cartão (paga pelo cliente)
+    currency        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','failed','expired')),
+    session_id      TEXT,                                  -- Stripe Checkout Session
+    payment_intent  TEXT,
+    tx_id           TEXT REFERENCES transactions(id),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS card_topups_session ON card_topups(session_id);
 
   CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY,
@@ -319,6 +509,32 @@ const MIGRATIONS = {
     // SQLite só é usado no computador (dados de teste), pede-se para apagar.
     sqlite: null,
   },
+  5: {
+    postgres: `
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS from_currency TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS from_amount BIGINT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS beneficiary_phone TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS provider TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS external_id TEXT;
+      ALTER TABLE bank_requests ADD COLUMN IF NOT EXISTS provider_status TEXT;
+    `,
+    sqlite: `
+      ALTER TABLE bank_requests ADD COLUMN from_currency TEXT;
+      ALTER TABLE bank_requests ADD COLUMN from_amount INTEGER;
+      ALTER TABLE bank_requests ADD COLUMN beneficiary_phone TEXT;
+      ALTER TABLE bank_requests ADD COLUMN provider TEXT;
+      ALTER TABLE bank_requests ADD COLUMN external_id TEXT;
+      ALTER TABLE bank_requests ADD COLUMN provider_status TEXT;
+    `,
+  },
+  6: {
+    postgres: `
+      ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
+      ALTER TABLE transactions ADD CONSTRAINT transactions_type_check
+        CHECK (type IN ('p2p','request','cash_in','cash_out','issue','exchange','bank_in','bank_out','merchant','settlement','refund','bill','commission','card_in'));
+    `,
+    sqlite: null,
+  },
 };
 
 async function openDb({ url, file } = {}) {
@@ -352,6 +568,8 @@ async function openDb({ url, file } = {}) {
         console.log(`Base de dados atualizada para a versão ${v}.`);
       }
     }
+    // Índices que dependem de colunas acrescentadas por atualizações (depois de as aplicar).
+    await db.execRaw('CREATE INDEX IF NOT EXISTS bank_req_external ON bank_requests(provider, external_id)');
     await db.run('INSERT INTO schema_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value', 'version', String(SCHEMA_VERSION));
     // Contas internas da empresa e câmbio inicial (uma única vez por moeda).
     for (const [cur, info] of Object.entries(CURRENCIES)) {
