@@ -15,7 +15,7 @@ input:focus, select:focus { outline: 2px solid var(--green); border-color: trans
 label { display: block; font-size: .9rem; color: var(--muted); margin-bottom: 14px; }
 label > input, label > select, label > .phone { margin-top: 6px; }
 
-.screen { max-width: 480px; margin: 0 auto; padding: 16px 16px 40px; }
+.screen { max-width: 480px; margin: 0 auto; padding: calc(16px + env(safe-area-inset-top)) 16px calc(40px + env(safe-area-inset-bottom)); }
 .brand { text-align: center; padding: 32px 0 20px; }
 .brand h1 { margin: 10px 0 4px; color: var(--green); }
 .brand p { margin: 0; color: var(--muted); }
@@ -136,3 +136,15 @@ a { color: var(--green); }
 .agent-card { border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 10px; font-size: .9rem; }
 .agent-card strong { display: block; }
 .toggle-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+
+.top-left { display: flex; align-items: center; gap: 12px; }
+.menu-btn { position: relative; font-size: 1.4rem; font-weight: 700; line-height: 1; color: #fff; }
+.menu-dot { position: absolute; top: 4px; right: 4px; width: 10px; height: 10px; border-radius: 50%; background: var(--yellow); border: 2px solid var(--green); }
+.drawer { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 15; display: flex; }
+.drawer-panel { width: min(320px, 86vw); height: 100%; background: #fff; overflow-y: auto; padding: calc(16px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom)); box-shadow: 4px 0 20px rgba(0,0,0,.2); animation: slideIn .18s ease-out; }
+@keyframes slideIn { from { transform: translateX(-100%); } to { transform: none; } }
+.drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.drawer-head .icon-btn { background: #eef2ef; }
+.menu-section h3 { font-size: .85rem; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 18px 0 6px; }
+.menu-item { display: flex; justify-content: space-between; align-items: center; width: 100%; text-align: left; border: 0; background: none; padding: 12px 6px; border-bottom: 1px solid var(--line); font-size: 1rem; color: var(--text); }
+.menu-item:active { background: #f3f5f2; }

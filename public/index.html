@@ -52,9 +52,12 @@
   <!-- Ecrã principal -->
   <main id="home" class="screen" hidden>
     <header class="top">
-      <div>
-        <small>Olá,</small>
-        <strong id="hello"></strong>
+      <div class="top-left">
+        <button type="button" class="icon-btn menu-btn" id="menuBtn" aria-label="Menu de agente e administração" aria-expanded="false" hidden>⋮<span class="menu-dot" id="menuDot" hidden></span></button>
+        <div>
+          <small>Olá,</small>
+          <strong id="hello"></strong>
+        </div>
       </div>
       <button type="button" class="icon-btn" data-open="profile" aria-label="Perfil">👤</button>
     </header>
@@ -82,25 +85,7 @@
       <button type="button" class="btn small primary" data-open="charge" style="width:auto">Cobrar</button>
       <button type="button" class="btn small" data-open="charges">Cobranças</button>
     </section>
-    <section id="agentBar" class="role-bar" hidden>
-      <strong>Agente</strong>
-      <button type="button" class="btn small" data-open="cashin">Depósito de cliente</button>
-      <button type="button" class="btn small" data-open="redeem">Levantamento de cliente</button>
-      <button type="button" class="btn small" data-open="agentProfile">O meu ponto</button>
-      <button type="button" class="btn small" data-open="agentStats">Comissões</button>
-    </section>
-    <section id="adminBar" class="role-bar" hidden>
-      <strong>Admin</strong>
-      <button type="button" class="btn small" data-open="admin">Painel</button>
-      <button type="button" class="btn small" data-open="float">Emitir float</button>
-      <button type="button" class="btn small" data-open="rates">Câmbios</button>
-      <button type="button" class="btn small" data-open="bankAdmin">Banco <span id="bankBadge" class="badge"></span></button>
-      <button type="button" class="btn small" data-open="settlement">Acertos</button>
-      <button type="button" class="btn small" data-open="kycAdmin">Identidade <span id="kycBadge" class="badge"></span></button>
-      <button type="button" class="btn small" data-open="alerts">Alertas <span id="alertBadge" class="badge"></span></button>
-      <button type="button" class="btn small" data-open="reports">Relatórios</button>
-      <button type="button" class="btn small" data-open="ussdSim">USSD</button>
-    </section>
+
 
     <section id="pending"></section>
 
@@ -109,6 +94,32 @@
       <ul id="history" class="tx-list"></ul>
     </section>
   </main>
+
+  <!-- Menu lateral (⋮): ferramentas de agente e de administração -->
+  <div id="menu" class="drawer" hidden>
+    <nav class="drawer-panel" aria-label="Menu de agente e administração">
+      <div class="drawer-head"><strong>Menu</strong><button type="button" class="icon-btn" id="menuClose" aria-label="Fechar">✕</button></div>
+    <section id="agentBar" class="menu-section" hidden>
+      <h3>🧑🏾‍💼 Agente</h3>
+      <button type="button" class="menu-item" data-open="cashin">Depósito de cliente</button>
+      <button type="button" class="menu-item" data-open="redeem">Levantamento de cliente</button>
+      <button type="button" class="menu-item" data-open="agentProfile">O meu ponto</button>
+      <button type="button" class="menu-item" data-open="agentStats">Comissões</button>
+    </section>
+    <section id="adminBar" class="menu-section" hidden>
+      <h3>🛠 Administração</h3>
+      <button type="button" class="menu-item" data-open="admin">Painel</button>
+      <button type="button" class="menu-item" data-open="float">Emitir float</button>
+      <button type="button" class="menu-item" data-open="rates">Câmbios</button>
+      <button type="button" class="menu-item" data-open="bankAdmin">Banco <span id="bankBadge" class="badge"></span></button>
+      <button type="button" class="menu-item" data-open="settlement">Acertos</button>
+      <button type="button" class="menu-item" data-open="kycAdmin">Identidade <span id="kycBadge" class="badge"></span></button>
+      <button type="button" class="menu-item" data-open="alerts">Alertas <span id="alertBadge" class="badge"></span></button>
+      <button type="button" class="menu-item" data-open="reports">Relatórios</button>
+      <button type="button" class="menu-item" data-open="ussdSim">USSD</button>
+    </section>
+    </nav>
+  </div>
 
   <!-- Folha (modal) reutilizada por todos os formulários -->
   <div id="sheet" class="sheet" hidden>
